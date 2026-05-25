@@ -1,10 +1,12 @@
 import { useEffect, useState } from 'react';
+import { useVisibility } from '../../lib/useVisibility';
 
 const POLL_INTERVAL_MS = 3000;
 
 export function useMedia(onError: (message: string) => void) {
     const [tracks, setTracks] = useState<MediaTrack[]>([]);
     const [loading, setLoading] = useState(false);
+    const visible = useVisibility();
 
     const available = typeof window !== 'undefined' && Boolean(window.mediaAPI);
 
@@ -22,14 +24,14 @@ export function useMedia(onError: (message: string) => void) {
     };
 
     useEffect(() => {
-        if (!available) return;
+        if (!available || !visible) return;
 
         load();
         const interval = window.setInterval(load, POLL_INTERVAL_MS);
 
         return () => window.clearInterval(interval);
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [available]);
+    }, [available, visible]);
 
     const control = async (action: MediaAction, bundleId?: string | null) => {
         if (!available) {

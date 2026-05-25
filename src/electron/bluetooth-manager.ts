@@ -570,7 +570,7 @@ export class BluetoothManager extends EventEmitter {
         }
     }
 
-    async startMonitoring(intervalMs: number = 5000): Promise<void> {
+    async startMonitoring(intervalMs: number = 10000): Promise<void> {
         if (this.isMonitoring) return;
 
         this.isMonitoring = true;

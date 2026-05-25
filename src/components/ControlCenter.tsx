@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Activity, Bluetooth, ChevronUp, Container, Loader2, Music2, RefreshCw, Terminal, X } from 'lucide-react';
+import { Activity, Bluetooth, ChevronUp, Container, Cpu, HardDrive, Loader2, Monitor, Music2, RefreshCw, Settings as SettingsIcon, Terminal, X } from 'lucide-react';
 import { BluetoothPanel } from './bluetooth/BluetoothPanel';
 import { useBluetooth } from './bluetooth/useBluetooth';
 import { DockerPanel } from './docker/DockerPanel';
@@ -8,12 +8,16 @@ import { useMedia } from './media/useMedia';
 import { SshPanel } from './ssh/SshPanel';
 import { SshTerminalDrawer } from './ssh/SshTerminalDrawer';
 import { useSshSessions } from './ssh/useSshSessions';
+import { DiskUsagePanel } from './disk/DiskUsagePanel';
+import { RdpPanel } from './rdp/RdpPanel';
+import { SettingsPanel } from './settings/SettingsPanel';
+import { ProcessDrawer } from './system/ProcessDrawer';
 import { SystemMonitorPanel } from './system/SystemMonitorPanel';
 import { useSystemMetrics } from './system/useSystemMetrics';
 import { TabNav, type TabItem } from './tabs/TabNav';
 import { ThemeToggle } from './theme/ThemeToggle';
 
-type TabId = 'ssh' | 'docker' | 'bluetooth' | 'system' | 'media';
+type TabId = 'ssh' | 'rdp' | 'docker' | 'bluetooth' | 'system' | 'disk' | 'media' | 'settings';
 
 const ERROR_VISIBLE_MS = 5000;
 
@@ -32,6 +36,7 @@ export function ControlCenter() {
 
     const sshSessions = useSshSessions();
     const [terminalDrawerOpen, setTerminalDrawerOpen] = useState(false);
+    const [processDrawerOpen, setProcessDrawerOpen] = useState(false);
     const prevSessionCountRef = useRef(0);
 
     useEffect(() => {
@@ -55,10 +60,13 @@ export function ControlCenter() {
 
     const tabs: TabItem[] = [
         { id: 'ssh', label: 'SSH', icon: Terminal },
+        { id: 'rdp', label: 'RDP', icon: Monitor },
         { id: 'docker', label: 'Docker', icon: Container },
         { id: 'bluetooth', label: 'Bluetooth', icon: Bluetooth, badge: bluetooth.connectedDevices.length || undefined },
         { id: 'system', label: 'System', icon: Activity },
-        { id: 'media', label: 'Media', icon: Music2 }
+        { id: 'disk', label: 'Disk Utils', icon: HardDrive },
+        { id: 'media', label: 'Media', icon: Music2 },
+        { id: 'settings', label: 'Settings', icon: SettingsIcon }
     ];
 
     return (
@@ -82,6 +90,23 @@ export function ControlCenter() {
                     </div>
 
                     <div className="no-drag flex items-center gap-2">
+                        <button
+                            type="button"
+                            className={`inline-flex h-9 items-center gap-2 rounded-md border px-3 text-sm font-medium transition ${
+                                processDrawerOpen
+                                    ? 'border-zinc-200 bg-white text-zinc-700 hover:bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:bg-zinc-800'
+                                    : 'border-amber-200 bg-white text-amber-700 hover:bg-amber-50 dark:border-amber-900 dark:bg-zinc-900 dark:text-amber-300 dark:hover:bg-amber-950'
+                            }`}
+                            onClick={() => setProcessDrawerOpen((v) => !v)}
+                            title={processDrawerOpen ? 'Hide processes' : 'Show processes'}
+                        >
+                            {processDrawerOpen ? (
+                                <X className="h-4 w-4" aria-hidden="true" />
+                            ) : (
+                                <Cpu className="h-4 w-4" aria-hidden="true" />
+                            )}
+                            {processDrawerOpen ? 'Hide' : 'Processes'}
+                        </button>
                         {sshSessions.sessions.length > 0 && (
                             <button
                                 type="button"
@@ -141,6 +166,8 @@ export function ControlCenter() {
 
                 {activeTab === 'ssh' && <SshPanel sshSessions={sshSessions} />}
 
+                {activeTab === 'rdp' && <RdpPanel />}
+
                 {activeTab === 'docker' && <DockerPanel onExec={handleDockerExec} />}
 
                 {activeTab === 'bluetooth' && (
@@ -162,6 +189,8 @@ export function ControlCenter() {
                     />
                 )}
 
+                {activeTab === 'disk' && <DiskUsagePanel />}
+
                 {activeTab === 'media' && (
                     <MediaPanel
                         tracks={media.tracks}
@@ -170,6 +199,8 @@ export function ControlCenter() {
                         onControl={media.control}
                     />
                 )}
+
+                {activeTab === 'settings' && <SettingsPanel />}
             </div>
 
             <SshTerminalDrawer
@@ -181,6 +212,8 @@ export function ControlCenter() {
                 onDetach={sshSessions.detach}
                 onMinimize={() => setTerminalDrawerOpen(false)}
             />
+
+            <ProcessDrawer open={processDrawerOpen} onMinimize={() => setProcessDrawerOpen(false)} />
 
             {sshSessions.sessions.length > 0 && !terminalDrawerOpen && (
                 <button

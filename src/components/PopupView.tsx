@@ -22,15 +22,17 @@ import {
 import { useBluetooth } from './bluetooth/useBluetooth';
 import { useMedia } from './media/useMedia';
 import { useSystemMetrics } from './system/useSystemMetrics';
+import { useAppSettings } from './useAppSettings';
 import { formatBytes, formatPercent, formatRate } from '../lib/format';
+import { useVisibility } from '../lib/useVisibility';
 
 const noop = () => {};
 
-function useActiveSessions(refreshMs: number) {
+function useActiveSessions(refreshMs: number, visible: boolean) {
     const [sessions, setSessions] = useState<SshActiveSession[]>([]);
 
     useEffect(() => {
-        if (typeof window === 'undefined' || !window.sshAPI) return;
+        if (typeof window === 'undefined' || !window.sshAPI || !visible) return;
         let cancelled = false;
 
         const load = async () => {
@@ -48,12 +50,12 @@ function useActiveSessions(refreshMs: number) {
             cancelled = true;
             window.clearInterval(interval);
         };
-    }, [refreshMs]);
+    }, [refreshMs, visible]);
 
     return sessions;
 }
 
-function useDockerContainers(refreshMs: number) {
+function useDockerContainers(refreshMs: number, visible: boolean) {
     const [containers, setContainers] = useState<DockerContainer[]>([]);
     const [available, setAvailable] = useState(true);
     const [reloadKey, setReloadKey] = useState(0);
@@ -63,6 +65,7 @@ function useDockerContainers(refreshMs: number) {
             setAvailable(false);
             return;
         }
+        if (!visible) return;
         let cancelled = false;
 
         const load = async () => {
@@ -86,17 +89,20 @@ function useDockerContainers(refreshMs: number) {
             cancelled = true;
             window.clearInterval(interval);
         };
-    }, [refreshMs, reloadKey]);
+    }, [refreshMs, reloadKey, visible]);
 
     return { containers, available, refresh: () => setReloadKey((k) => k + 1) };
 }
 
 export function PopupView() {
+    const { settings } = useAppSettings();
+    const sections = settings.popup;
+    const visible = useVisibility();
     const { tracks, control } = useMedia(noop);
     const { connectedDevices } = useBluetooth(noop);
     const { metrics } = useSystemMetrics();
-    const activeSessions = useActiveSessions(3000);
-    const docker = useDockerContainers(5000);
+    const activeSessions = useActiveSessions(3000, visible);
+    const docker = useDockerContainers(5000, visible);
 
     useEffect(() => {
         document.body.classList.add('popup-body');
@@ -116,11 +122,11 @@ export function PopupView() {
 
     return (
         <div className="flex h-screen w-screen flex-col gap-3 overflow-y-auto p-3 text-zinc-900 dark:text-zinc-100">
-            <NowPlayingCard track={track} onControl={control} />
-            <BluetoothCard devices={bluetoothWithBattery} />
-            <SystemCard metrics={metrics} />
-            <SshSessionsCard sessions={activeSessions} />
-            {docker.available && (
+            {sections.showMedia && <NowPlayingCard track={track} onControl={control} />}
+            {sections.showBluetooth && <BluetoothCard devices={bluetoothWithBattery} />}
+            {sections.showSystem && <SystemCard metrics={metrics} />}
+            {sections.showSsh && <SshSessionsCard sessions={activeSessions} />}
+            {sections.showDocker && docker.available && (
                 <DockerCard containers={docker.containers} onMutated={docker.refresh} />
             )}
 

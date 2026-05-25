@@ -10524,10 +10524,10 @@ var require_lib2 = __commonJS({
 });
 
 // main.js
-var import_electron4 = require("electron");
-var import_fs4 = require("fs");
-var import_os5 = __toESM(require("os"), 1);
-var import_path7 = __toESM(require("path"), 1);
+var import_electron5 = require("electron");
+var import_fs8 = require("fs");
+var import_os8 = __toESM(require("os"), 1);
+var import_path12 = __toESM(require("path"), 1);
 var import_url2 = require("url");
 
 // src/electron/bluetooth-manager.ts
@@ -11461,7 +11461,7 @@ var BluetoothManager = class extends import_events.EventEmitter {
       return null;
     }
   }
-  async startMonitoring(intervalMs = 5e3) {
+  async startMonitoring(intervalMs = 1e4) {
     if (this.isMonitoring) return;
     this.isMonitoring = true;
     await this.getDevices();
@@ -11514,7 +11514,7 @@ function normalizeMediaRemoteEntry(info) {
   const bundleId = stringFrom(info.__bundleId);
   const pid = numberFrom(info.__pid);
   const displayName = stringFrom(info.__displayName);
-  const app4 = displayName ?? stringFrom(info.kMRMediaRemoteNowPlayingClientName) ?? stringFrom(info.kMRMediaRemoteNowPlayingApplicationDisplayName) ?? bundleId;
+  const app5 = displayName ?? stringFrom(info.kMRMediaRemoteNowPlayingClientName) ?? stringFrom(info.kMRMediaRemoteNowPlayingApplicationDisplayName) ?? bundleId;
   const duration = numberFrom(info.kMRMediaRemoteNowPlayingInfoDuration);
   const elapsed = numberFrom(info.kMRMediaRemoteNowPlayingInfoElapsedTime);
   const playbackRate = numberFrom(info.kMRMediaRemoteNowPlayingInfoPlaybackRate);
@@ -11526,7 +11526,7 @@ function normalizeMediaRemoteEntry(info) {
     title,
     artist,
     album,
-    app: app4,
+    app: app5,
     bundleId,
     pid: pid ?? null,
     artworkUrl: null,
@@ -11688,10 +11688,19 @@ var MediaManager = class {
 
 // src/electron/system-monitor.ts
 var import_child_process3 = require("child_process");
+var import_fs3 = require("fs");
 var import_os = __toESM(require("os"), 1);
 var import_util3 = require("util");
 var execFileAsync = (0, import_util3.promisify)(import_child_process3.execFile);
-var POSIX_ENV = { ...process.env, LC_ALL: "C", LANG: "C" };
+var POSIX_ENV = { ...process.env, LC_NUMERIC: "C", LC_CTYPE: "en_US.UTF-8" };
+function extractAppPath(command) {
+  const match = command.match(/^(.*?\.app)\//);
+  return match ? match[1] : null;
+}
+function appNameFromPath(appPath) {
+  const tail = appPath.split("/").filter(Boolean).pop() ?? appPath;
+  return tail.replace(/\.app$/, "");
+}
 var toNumber = (value) => {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : 0;
@@ -11711,12 +11720,6 @@ var getCpuSnapshot = () => {
 var SystemMonitor = class {
   previousCpu = getCpuSnapshot();
   previousNetwork = null;
-  // In a packaged .app, `process.cwd()` is `/` so the original heuristic
-  // (process.cwd + appSupportPath) matches nothing useful and the DFS
-  // through child processes also drags in unrelated Electron-based apps
-  // running on the system. Anchor on the .app bundle path instead — every
-  // child process spawned by this exact app has the bundle dir in its
-  // command line, and no other app does.
   projectRoot = (() => {
     const exe = process.execPath;
     const appMatch = exe.match(/^(.*?\.app)\//);
@@ -11765,16 +11768,16 @@ var SystemMonitor = class {
     };
   }
   async getDiskMetrics() {
+    const target = (0, import_fs3.existsSync)("/System/Volumes/Data") ? "/System/Volumes/Data" : "/";
     try {
-      const { stdout } = await execFileAsync("df", ["-k", "/"], { env: POSIX_ENV });
+      const { stdout } = await execFileAsync("df", ["-k", target], { env: POSIX_ENV });
       const line = stdout.trim().split("\n")[1];
       const parts = line?.trim().split(/\s+/) ?? [];
       const totalBytes = toNumber(parts[1]) * 1024;
       const usedBytes = toNumber(parts[2]) * 1024;
       const freeBytes = toNumber(parts[3]) * 1024;
-      const mount = parts[8] ?? "/";
       return {
-        mount,
+        mount: "/",
         totalBytes,
         usedBytes,
         freeBytes,
@@ -11909,21 +11912,22 @@ var SystemMonitor = class {
   }
   async getProcessList() {
     try {
-      const { stdout } = await execFileAsync("ps", ["-axo", "pid,ppid,%cpu,rss,comm,args"], { env: POSIX_ENV });
+      const { stdout } = await execFileAsync("ps", ["-axo", "pid,ppid,user,%cpu,rss,comm,args"], { env: POSIX_ENV });
       const lines = stdout.trim().split("\n");
       const parsed = lines.slice(1).map((line) => {
-        const match = line.match(/^\s*(\d+)\s+(\d+)\s+([\d.]+)\s+(\d+)\s+(\S+)\s+(.*)$/);
+        const match = line.match(/^\s*(\d+)\s+(\d+)\s+(\S+)\s+([\d.]+)\s+(\d+)\s+(\S+)\s+(.*)$/);
         if (!match) {
           return null;
         }
-        const commandPath = match[5] ?? "";
-        const command = match[6] ?? commandPath;
+        const commandPath = match[6] ?? "";
+        const command = match[7] ?? commandPath;
         const name = commandPath.split("/").filter(Boolean).pop() ?? command.split(/\s+/)[0] ?? "process";
         return {
           pid: toNumber(match[1]),
           ppid: toNumber(match[2]),
-          cpuPercent: toNumber(match[3]),
-          memoryBytes: toNumber(match[4]) * 1024,
+          user: match[3] ?? "",
+          cpuPercent: toNumber(match[4]),
+          memoryBytes: toNumber(match[5]) * 1024,
           name,
           command,
           role: this.getProcessRole(name, command)
@@ -11933,6 +11937,40 @@ var SystemMonitor = class {
     } catch (error) {
       console.error("[SystemMonitor] ps failed:", error);
       return [];
+    }
+  }
+  async listAllProcesses() {
+    const processes = await this.getProcessList();
+    const currentUser = import_os.default.userInfo().username;
+    return processes.map((item) => {
+      const appPath = extractAppPath(item.command);
+      return {
+        pid: item.pid,
+        ppid: item.ppid,
+        user: item.user,
+        isOwnUser: item.user === currentUser,
+        cpuPercent: item.cpuPercent,
+        memoryBytes: item.memoryBytes,
+        name: item.name,
+        command: item.command,
+        appPath,
+        appName: appPath ? appNameFromPath(appPath) : null
+      };
+    });
+  }
+  killProcess(pid, signal = "SIGTERM") {
+    if (!Number.isInteger(pid) || pid <= 1) {
+      return { success: false, error: "Invalid PID", code: "EINVAL" };
+    }
+    try {
+      process.kill(pid, signal);
+      return { success: true };
+    } catch (error) {
+      return {
+        success: false,
+        error: error?.message ?? String(error),
+        code: error?.code
+      };
     }
   }
   getProcessRole(name, command) {
@@ -12049,12 +12087,18 @@ async function listFileBasedHosts() {
 }
 
 // src/electron/db.ts
-var import_fs3 = require("fs");
+var import_fs4 = require("fs");
 var import_promises2 = require("fs/promises");
 var import_module = require("module");
 var import_path5 = __toESM(require("path"), 1);
 var import_electron2 = require("electron");
 var import_sql = __toESM(require("sql.js"), 1);
+var DB_TABLE_GROUPS = {
+  sshHosts: ["saved_hosts", "host_overrides", "port_forwards"],
+  rdpHosts: ["rdp_hosts"],
+  mediaHistory: ["media_history"],
+  mediaStats: ["media_artist_stats", "media_track_stats"]
+};
 var require2 = (0, import_module.createRequire)(__cjs_meta_url);
 var DB_FILENAME = "ebala.db";
 var db = null;
@@ -12167,10 +12211,26 @@ var runMigrations = (database) => {
         );
         CREATE INDEX IF NOT EXISTS idx_media_track_stats_artist ON media_track_stats (artist, total_seconds DESC);
         CREATE INDEX IF NOT EXISTS idx_media_track_stats_total ON media_track_stats (total_seconds DESC);
+
+        CREATE TABLE IF NOT EXISTS rdp_hosts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            label TEXT NOT NULL,
+            hostname TEXT NOT NULL,
+            port INTEGER NOT NULL DEFAULT 3389,
+            username TEXT NOT NULL,
+            password_encrypted BLOB,
+            domain TEXT,
+            color TEXT,
+            notes TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_rdp_hosts_label ON rdp_hosts (label);
     `);
   addColumnIfMissing(database, "host_overrides", "username", "TEXT");
   addColumnIfMissing(database, "host_overrides", "password_encrypted", "BLOB");
   addColumnIfMissing(database, "host_overrides", "auth_method", "TEXT");
+  addColumnIfMissing(database, "rdp_hosts", "extra_args", "TEXT");
   const hasArtistRows = (database.exec("SELECT 1 FROM media_artist_stats LIMIT 1")[0]?.values.length ?? 0) > 0;
   const hasHistoryRows = (database.exec("SELECT 1 FROM media_history WHERE listened_seconds >= 5 LIMIT 1")[0]?.values.length ?? 0) > 0;
   if (!hasArtistRows && hasHistoryRows) {
@@ -12199,6 +12259,24 @@ var runMigrations = (database) => {
         `);
   }
 };
+async function openWithFallback(SQL, filePath) {
+  if (!(0, import_fs4.existsSync)(filePath)) return new SQL.Database();
+  const buffer = await (0, import_promises2.readFile)(filePath);
+  try {
+    const candidate = new SQL.Database(buffer);
+    candidate.exec("PRAGMA quick_check");
+    return candidate;
+  } catch (err) {
+    const stamp = (/* @__PURE__ */ new Date()).toISOString().replace(/[:.]/g, "-");
+    const quarantine = `${filePath}.corrupted-${stamp}`;
+    try {
+      await (0, import_promises2.rename)(filePath, quarantine);
+    } catch {
+    }
+    console.error(`[db] image malformed (${err?.message ?? err}); quarantined to ${quarantine}, starting fresh`);
+    return new SQL.Database();
+  }
+}
 async function initDb() {
   if (db) return db;
   const sqlJsDistPath = import_path5.default.dirname(require2.resolve("sql.js/dist/sql-wasm.js"));
@@ -12206,13 +12284,12 @@ async function initDb() {
     locateFile: (file) => import_path5.default.join(sqlJsDistPath, file)
   });
   const userData = import_electron2.app.getPath("userData");
-  if (!(0, import_fs3.existsSync)(userData)) {
-    (0, import_fs3.mkdirSync)(userData, { recursive: true });
+  if (!(0, import_fs4.existsSync)(userData)) {
+    (0, import_fs4.mkdirSync)(userData, { recursive: true });
   }
   dbPath = import_path5.default.join(userData, DB_FILENAME);
-  if ((0, import_fs3.existsSync)(dbPath)) {
-    const buffer = await (0, import_promises2.readFile)(dbPath);
-    db = new SQL.Database(buffer);
+  if ((0, import_fs4.existsSync)(dbPath)) {
+    db = await openWithFallback(SQL, dbPath);
   } else {
     db = new SQL.Database();
   }
@@ -12228,7 +12305,17 @@ function persist() {
   persistQueue = persistQueue.then(async () => {
     if (!db || !dbPath) return;
     const data = db.export();
-    await (0, import_promises2.writeFile)(dbPath, data);
+    const tmpPath = `${dbPath}.tmp`;
+    try {
+      await (0, import_promises2.writeFile)(tmpPath, data);
+      await (0, import_promises2.rename)(tmpPath, dbPath);
+    } catch (err) {
+      try {
+        await (0, import_promises2.unlink)(tmpPath);
+      } catch {
+      }
+      throw err;
+    }
   });
   return persistQueue;
 }
@@ -12238,6 +12325,50 @@ async function closeDb() {
     db.close();
     db = null;
   }
+}
+function countRows(database, tables) {
+  let total = 0;
+  for (const table of tables) {
+    const result = database.exec(`SELECT COUNT(*) FROM ${table}`)[0];
+    const value = result?.values?.[0]?.[0];
+    total += typeof value === "number" ? value : Number(value ?? 0);
+  }
+  return total;
+}
+async function getDbStats() {
+  const database = getDb();
+  await persistQueue;
+  const sizeBytes = dbPath && (0, import_fs4.existsSync)(dbPath) ? (0, import_fs4.statSync)(dbPath).size : 0;
+  const groups = Object.fromEntries(
+    Object.entries(DB_TABLE_GROUPS).map(
+      ([key, tables]) => [key, { rowCount: countRows(database, tables), tables: [...tables] }]
+    )
+  );
+  return { sizeBytes, path: dbPath ?? "", groups };
+}
+async function clearTables(groups) {
+  const database = getDb();
+  const tables = /* @__PURE__ */ new Set();
+  for (const group of groups) {
+    const list = DB_TABLE_GROUPS[group];
+    if (!list) continue;
+    for (const table of list) tables.add(table);
+  }
+  if (tables.size > 0) {
+    database.exec("BEGIN TRANSACTION");
+    try {
+      for (const table of tables) {
+        database.exec(`DELETE FROM ${table}`);
+      }
+      database.exec("COMMIT");
+      database.exec("VACUUM");
+    } catch (error) {
+      database.exec("ROLLBACK");
+      throw error;
+    }
+    await persist();
+  }
+  return getDbStats();
 }
 
 // src/electron/credential-store.ts
@@ -12655,11 +12786,81 @@ async function listAllSshHosts() {
 
 // src/electron/ssh-manager.ts
 var import_events2 = require("events");
-var import_net = __toESM(require("net"), 1);
+var import_net2 = __toESM(require("net"), 1);
 var import_os3 = __toESM(require("os"), 1);
 var import_crypto = require("crypto");
 var import_node_pty = require("node-pty");
 var import_ssh2 = require("ssh2");
+
+// src/electron/host-resolver.ts
+var import_child_process4 = require("child_process");
+var import_promises3 = __toESM(require("dns/promises"), 1);
+var import_net = __toESM(require("net"), 1);
+var import_util4 = require("util");
+var execFileAsync2 = (0, import_util4.promisify)(import_child_process4.execFile);
+var IPV4_RE = /^(?:\d{1,3}\.){3}\d{1,3}$/;
+var IPV6_RE = /:/;
+function isIp(value) {
+  return IPV4_RE.test(value) || IPV6_RE.test(value);
+}
+async function lookupViaNode(hostname) {
+  try {
+    const result = await import_promises3.default.lookup(hostname, { family: 4, all: false });
+    return result.address;
+  } catch {
+  }
+  try {
+    const result = await import_promises3.default.lookup(hostname, { family: 6, all: false });
+    return result.address;
+  } catch {
+    return null;
+  }
+}
+async function lookupViaSystem(hostname) {
+  try {
+    const { stdout } = await execFileAsync2("dscacheutil", ["-q", "host", "-a", "name", hostname], {
+      timeout: 5e3
+    });
+    const match = stdout.match(/ipv4_address:\s*(\S+)/) ?? stdout.match(/ip_address:\s*(\S+)/);
+    return match ? match[1] : null;
+  } catch {
+    return null;
+  }
+}
+async function resolveHost(hostname) {
+  if (isIp(hostname)) {
+    return { address: hostname, via: "literal" };
+  }
+  if (hostname.endsWith(".ts.net") || hostname.includes(".tail")) {
+    const fromSystem2 = await lookupViaSystem(hostname);
+    if (fromSystem2) return { address: fromSystem2, via: "system" };
+  }
+  const fromNode = await lookupViaNode(hostname);
+  if (fromNode) return { address: fromNode, via: "dns" };
+  const fromSystem = await lookupViaSystem(hostname);
+  if (fromSystem) return { address: fromSystem, via: "system" };
+  return { address: hostname, via: "unresolved" };
+}
+async function tcpPreflight(address, port, timeoutMs = 8e3) {
+  return new Promise((resolve, reject) => {
+    const socket = import_net.default.connect({ host: address, port });
+    const timer = setTimeout(() => {
+      socket.destroy();
+      reject(new Error(`TCP timeout connecting to ${address}:${port}`));
+    }, timeoutMs);
+    socket.once("connect", () => {
+      clearTimeout(timer);
+      socket.end();
+      resolve();
+    });
+    socket.once("error", (err) => {
+      clearTimeout(timer);
+      reject(new Error(`TCP error: ${err.message}`));
+    });
+  });
+}
+
+// src/electron/ssh-manager.ts
 var enabledForwards = (hostId) => listPortForwards(hostId).filter((forward) => forward.enabled);
 var buildSshCliArgs = (host) => {
   const args = [];
@@ -12679,6 +12880,21 @@ var buildSshCliArgs = (host) => {
 };
 var SshManager = class extends import_events2.EventEmitter {
   sessions = /* @__PURE__ */ new Map();
+  emitData(sessionId, data) {
+    const session = this.sessions.get(sessionId);
+    if (session?.kind === "ssh2" && session.pendingPrefix) {
+      this.emit("data", { sessionId, data: session.pendingPrefix + data });
+      session.pendingPrefix = "";
+      return;
+    }
+    this.emit("data", { sessionId, data });
+  }
+  appendPending(session, data) {
+    session.pendingPrefix += data;
+    if (session.pendingPrefix.length > 4096) {
+      session.pendingPrefix = session.pendingPrefix.slice(-4096);
+    }
+  }
   list() {
     return Array.from(this.sessions.values()).map((session) => ({
       sessionId: session.id,
@@ -12762,6 +12978,7 @@ var SshManager = class extends import_events2.EventEmitter {
     const { host, cols, rows, target } = args;
     const id = (0, import_crypto.randomUUID)();
     const client = new import_ssh2.Client();
+    const resolvePromise = resolveHost(target.hostname);
     const session = {
       id,
       host,
@@ -12769,7 +12986,8 @@ var SshManager = class extends import_events2.EventEmitter {
       client,
       stream: null,
       forwardServers: [],
-      remoteForwards: []
+      remoteForwards: [],
+      pendingPrefix: ""
     };
     this.sessions.set(id, session);
     const fail = (err) => {
@@ -12778,9 +12996,10 @@ var SshManager = class extends import_events2.EventEmitter {
       this.emit("exit", { sessionId: id, exitCode: 1, error: err.message });
     };
     client.on("error", (err) => {
-      this.emit("data", { sessionId: id, data: `\r
-\x1B[31mError: ${err.message}\x1B[0m\r
-` });
+      const hint = /handshake/i.test(err.message) ? " (TCP works but the SSH service did not respond. Wrong port, sshd down, or a Tailscale ACL blocking port?)" : "";
+      this.emitData(id, `\r
+\x1B[31mError: ${err.message}${hint}\x1B[0m\r
+`);
       fail(err);
     });
     client.on("end", () => {
@@ -12799,7 +13018,7 @@ var SshManager = class extends import_events2.EventEmitter {
         reject();
         return;
       }
-      const local = import_net.default.connect(forwardConfig.targetPort, forwardConfig.targetHost);
+      const local = import_net2.default.connect(forwardConfig.targetPort, forwardConfig.targetHost);
       local.on("error", () => reject());
       local.on("connect", () => {
         const remote = accept();
@@ -12807,11 +13026,11 @@ var SshManager = class extends import_events2.EventEmitter {
       });
     });
     client.on("ready", () => {
-      this.emit("data", {
-        sessionId: id,
-        data: `\x1B[32mConnected to ${target.username}@${target.hostname}:${target.port}\x1B[0m\r
+      this.emitData(
+        id,
+        `\x1B[32mConnected to ${target.username}@${target.hostname}:${target.port}\x1B[0m\r
 `
-      });
+      );
       this.setupSsh2Tunnels(session);
       client.shell({ term: "xterm-256color", cols, rows }, (err, stream) => {
         if (err) {
@@ -12833,18 +13052,52 @@ var SshManager = class extends import_events2.EventEmitter {
         });
       });
     });
-    try {
-      client.connect({
-        host: target.hostname,
-        port: target.port,
-        username: target.username,
-        password: target.password,
-        readyTimeout: 15e3,
-        keepaliveInterval: 3e4
-      });
-    } catch (err) {
-      fail(err);
-    }
+    resolvePromise.then(async ({ address, via }) => {
+      if (via === "unresolved") {
+        this.emitData(
+          id,
+          `\r
+\x1B[31mCould not resolve ${target.hostname}. For Tailscale: try the 100.x.x.x IP or full \`.ts.net\` name.\x1B[0m\r
+`
+        );
+        fail(new Error(`Could not resolve ${target.hostname}`));
+        return;
+      }
+      if (via !== "literal") {
+        this.appendPending(
+          session,
+          `\x1B[36mResolved ${target.hostname} \u2192 ${address} (${via})\x1B[0m\r
+`
+        );
+      }
+      try {
+        await tcpPreflight(address, target.port, 8e3);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        this.emitData(
+          id,
+          `\r
+\x1B[31m${message}. Tailscale tunnel up? Try \`tailscale status\` / \`tailscale ping ${target.hostname}\`.\x1B[0m\r
+`
+        );
+        fail(err instanceof Error ? err : new Error(message));
+        return;
+      }
+      this.appendPending(session, `\x1B[36mTCP ok ${address}:${target.port}, waiting for SSH banner\u2026\x1B[0m\r
+`);
+      try {
+        client.connect({
+          host: address,
+          port: target.port,
+          username: target.username,
+          password: target.password,
+          readyTimeout: 3e4,
+          keepaliveInterval: 3e4
+        });
+      } catch (err) {
+        fail(err);
+      }
+    }).catch((err) => fail(err));
     return { sessionId: id };
   }
   setupSsh2Tunnels(session) {
@@ -12861,7 +13114,7 @@ var SshManager = class extends import_events2.EventEmitter {
     for (const forward of forwards) {
       if (forward.type === "local") {
         const bindAddr = forward.bindAddress || "127.0.0.1";
-        const server = import_net.default.createServer((local) => {
+        const server = import_net2.default.createServer((local) => {
           session.client.forwardOut(
             bindAddr,
             forward.bindPort,
@@ -12984,6 +13237,70 @@ var SshManager = class extends import_events2.EventEmitter {
     this.sessions.clear();
   }
 };
+
+// src/electron/settings-store.ts
+var import_fs5 = require("fs");
+var import_promises4 = require("fs/promises");
+var import_path6 = __toESM(require("path"), 1);
+var import_electron4 = require("electron");
+var SETTINGS_FILENAME = "app-settings.json";
+var DEFAULT_SETTINGS = {
+  theme: "system",
+  popup: {
+    showMedia: true,
+    showBluetooth: true,
+    showSystem: true,
+    showSsh: true,
+    showDocker: true
+  },
+  hotkey: {
+    enabled: true,
+    combo: "Cmd+Shift+M"
+  }
+};
+var cached = null;
+var writeQueue = Promise.resolve();
+function settingsPath() {
+  const userData = import_electron4.app.getPath("userData");
+  if (!(0, import_fs5.existsSync)(userData)) (0, import_fs5.mkdirSync)(userData, { recursive: true });
+  return import_path6.default.join(userData, SETTINGS_FILENAME);
+}
+function mergeWithDefaults(partial) {
+  return {
+    theme: partial?.theme ?? DEFAULT_SETTINGS.theme,
+    popup: { ...DEFAULT_SETTINGS.popup, ...partial?.popup ?? {} },
+    hotkey: { ...DEFAULT_SETTINGS.hotkey, ...partial?.hotkey ?? {} }
+  };
+}
+async function loadSettings() {
+  if (cached) return cached;
+  const file = settingsPath();
+  if (!(0, import_fs5.existsSync)(file)) {
+    cached = { ...DEFAULT_SETTINGS, popup: { ...DEFAULT_SETTINGS.popup } };
+    return cached;
+  }
+  try {
+    const raw = await (0, import_promises4.readFile)(file, "utf8");
+    cached = mergeWithDefaults(JSON.parse(raw));
+    return cached;
+  } catch {
+    cached = { ...DEFAULT_SETTINGS, popup: { ...DEFAULT_SETTINGS.popup } };
+    return cached;
+  }
+}
+async function updateSettings(patch) {
+  const current = await loadSettings();
+  const next = {
+    theme: patch.theme ?? current.theme,
+    popup: { ...current.popup, ...patch.popup ?? {} },
+    hotkey: { ...current.hotkey, ...patch.hotkey ?? {} }
+  };
+  cached = next;
+  const file = settingsPath();
+  writeQueue = writeQueue.then(() => (0, import_promises4.writeFile)(file, JSON.stringify(next, null, 2)));
+  await writeQueue;
+  return next;
+}
 
 // src/electron/media-history.ts
 var rowToEntry = (row) => ({
@@ -13323,18 +13640,18 @@ var MediaTracker = class {
 };
 
 // src/electron/ssh-file-ops.ts
-var import_child_process4 = require("child_process");
+var import_child_process5 = require("child_process");
 var import_os4 = __toESM(require("os"), 1);
-var import_path6 = __toESM(require("path"), 1);
-var import_util4 = require("util");
-var execFileAsync2 = (0, import_util4.promisify)(import_child_process4.execFile);
-var KNOWN_HOSTS_PATH2 = import_path6.default.join(import_os4.default.homedir(), ".ssh", "known_hosts");
+var import_path7 = __toESM(require("path"), 1);
+var import_util5 = require("util");
+var execFileAsync3 = (0, import_util5.promisify)(import_child_process5.execFile);
+var KNOWN_HOSTS_PATH2 = import_path7.default.join(import_os4.default.homedir(), ".ssh", "known_hosts");
 async function removeFromKnownHosts(hostname) {
   if (!hostname || hostname.trim().length === 0) {
     return { success: false, error: "hostname is empty" };
   }
   try {
-    await execFileAsync2("ssh-keygen", ["-R", hostname, "-f", KNOWN_HOSTS_PATH2], {
+    await execFileAsync3("ssh-keygen", ["-R", hostname, "-f", KNOWN_HOSTS_PATH2], {
       timeout: 1e4
     });
     return { success: true };
@@ -13348,11 +13665,11 @@ async function removeFromKnownHosts(hostname) {
 
 // src/electron/docker-manager.ts
 var import_events3 = require("events");
-var import_child_process5 = require("child_process");
-var import_util5 = require("util");
+var import_child_process6 = require("child_process");
+var import_util6 = require("util");
 var import_crypto2 = require("crypto");
 var import_node_pty2 = require("node-pty");
-var execFileP = (0, import_util5.promisify)(import_child_process5.execFile);
+var execFileP = (0, import_util6.promisify)(import_child_process6.execFile);
 var RUN_TIMEOUT = 3e4;
 var PRUNE_TIMEOUT = 12e4;
 var parseJsonLines = (stdout, map) => {
@@ -13590,26 +13907,937 @@ var DockerManager = class extends import_events3.EventEmitter {
   }
 };
 
+// src/electron/local-fs.ts
+var import_promises5 = require("fs/promises");
+var import_os5 = __toESM(require("os"), 1);
+var import_path8 = __toESM(require("path"), 1);
+async function listLocal(dirPath) {
+  const target = dirPath || import_os5.default.homedir();
+  const entries = await (0, import_promises5.readdir)(target, { withFileTypes: true });
+  const results = await Promise.all(
+    entries.map(async (entry) => {
+      const full = import_path8.default.join(target, entry.name);
+      try {
+        const stats = await (0, import_promises5.stat)(full);
+        return {
+          name: entry.name,
+          path: full,
+          isDir: stats.isDirectory(),
+          isLink: entry.isSymbolicLink(),
+          size: stats.size,
+          mtimeMs: stats.mtimeMs
+        };
+      } catch {
+        return null;
+      }
+    })
+  );
+  return results.filter((entry) => entry !== null).sort((a, b) => {
+    if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
+    return a.name.localeCompare(b.name, void 0, { sensitivity: "base" });
+  });
+}
+function localHome() {
+  return import_os5.default.homedir();
+}
+
+// src/electron/sftp-manager.ts
+var import_crypto3 = require("crypto");
+var import_ssh22 = require("ssh2");
+
+// src/electron/ssh-credentials.ts
+var import_fs6 = require("fs");
+var import_os6 = __toESM(require("os"), 1);
+var import_path9 = __toESM(require("path"), 1);
+function expandHome2(filePath) {
+  if (filePath.startsWith("~/")) return import_path9.default.join(import_os6.default.homedir(), filePath.slice(2));
+  if (filePath === "~") return import_os6.default.homedir();
+  return filePath;
+}
+function loadPrivateKey(filePath) {
+  if (!filePath) return void 0;
+  const expanded = expandHome2(filePath);
+  if (!(0, import_fs6.existsSync)(expanded)) return void 0;
+  try {
+    return (0, import_fs6.readFileSync)(expanded);
+  } catch {
+    return void 0;
+  }
+}
+function resolveCredentials(host) {
+  const agentSocket = process.env.SSH_AUTH_SOCK || void 0;
+  if (host.source === "saved" && host.savedId !== void 0) {
+    const saved = getSavedHost(host.savedId);
+    if (!saved) throw new Error(`Saved host ${host.savedId} not found`);
+    const password = saved.authMethod === "password" ? getSavedHostPassword(host.savedId) : null;
+    const identityFile = saved.identityFile ?? void 0;
+    return {
+      hostname: saved.hostname,
+      port: saved.port,
+      username: saved.username,
+      password: password ?? void 0,
+      identityFile,
+      privateKey: loadPrivateKey(identityFile),
+      agentSocket
+    };
+  }
+  if (host.hasOverridePassword) {
+    const password = getOverridePassword(host.id);
+    if (!host.user) throw new Error("Override credential requires a username");
+    return {
+      hostname: host.hostname,
+      port: host.port ?? 22,
+      username: host.user,
+      password: password ?? void 0,
+      identityFile: host.identityFile,
+      privateKey: loadPrivateKey(host.identityFile),
+      agentSocket
+    };
+  }
+  return {
+    hostname: host.hostname,
+    port: host.port ?? 22,
+    username: host.user ?? import_os6.default.userInfo().username,
+    identityFile: host.identityFile,
+    privateKey: loadPrivateKey(host.identityFile),
+    agentSocket
+  };
+}
+
+// src/electron/sftp-manager.ts
+var SftpManager = class {
+  sessions = /* @__PURE__ */ new Map();
+  async connect(host) {
+    const creds = resolveCredentials(host);
+    const resolved = await resolveHost(creds.hostname);
+    if (resolved.via === "unresolved") {
+      throw new Error(
+        `Could not resolve ${creds.hostname}. For Tailscale, try the 100.x.x.x IP or full .ts.net name.`
+      );
+    }
+    try {
+      await tcpPreflight(resolved.address, creds.port, 8e3);
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      throw new Error(
+        `${detail}. Tailscale tunnel up? Try \`tailscale ping ${creds.hostname}\`.`
+      );
+    }
+    const client = new import_ssh22.Client();
+    const ready = new Promise((resolve, reject) => {
+      client.once("ready", () => resolve());
+      client.once("error", (err) => reject(err));
+    });
+    client.connect({
+      host: resolved.address,
+      port: creds.port,
+      username: creds.username,
+      password: creds.password,
+      privateKey: creds.privateKey,
+      agent: creds.agentSocket,
+      tryKeyboard: false,
+      readyTimeout: 15e3,
+      keepaliveInterval: 3e4
+    });
+    await ready;
+    const sftp = await new Promise((resolve, reject) => {
+      client.sftp((err, wrapper) => err ? reject(err) : resolve(wrapper));
+    });
+    const homePath = await new Promise((resolve) => {
+      sftp.realpath(".", (err, resolved2) => {
+        if (err || !resolved2) resolve("/");
+        else resolve(resolved2);
+      });
+    });
+    const id = (0, import_crypto3.randomUUID)();
+    this.sessions.set(id, { id, hostId: host.id, client, sftp, homePath });
+    client.on("close", () => {
+      this.sessions.delete(id);
+    });
+    return { sessionId: id, homePath };
+  }
+  async list(sessionId, dirPath) {
+    const session = this.requireSession(sessionId);
+    const target = dirPath || session.homePath;
+    const resolved = await new Promise((resolve, reject) => {
+      session.sftp.realpath(target, (err, value) => err ? reject(err) : resolve(value));
+    });
+    const entries = await new Promise((resolve, reject) => {
+      session.sftp.readdir(resolved, (err, list) => err ? reject(err) : resolve(list));
+    });
+    return entries.filter((entry) => entry.filename !== "." && entry.filename !== "..").map((entry) => ({
+      name: entry.filename,
+      path: posixJoin(resolved, entry.filename),
+      isDir: entry.attrs.isDirectory(),
+      isLink: entry.attrs.isSymbolicLink(),
+      size: entry.attrs.size ?? 0,
+      mtimeMs: (entry.attrs.mtime ?? 0) * 1e3
+    })).sort(compareEntries);
+  }
+  async mkdir(sessionId, dirPath) {
+    const session = this.requireSession(sessionId);
+    await new Promise((resolve, reject) => {
+      session.sftp.mkdir(dirPath, (err) => err ? reject(err) : resolve());
+    });
+  }
+  async remove(sessionId, targetPath, isDir) {
+    const session = this.requireSession(sessionId);
+    await new Promise((resolve, reject) => {
+      const op = isDir ? session.sftp.rmdir.bind(session.sftp) : session.sftp.unlink.bind(session.sftp);
+      op(targetPath, (err) => err ? reject(err) : resolve());
+    });
+  }
+  disconnect(sessionId) {
+    const session = this.sessions.get(sessionId);
+    if (!session) return false;
+    try {
+      session.client.end();
+    } catch {
+    }
+    this.sessions.delete(sessionId);
+    return true;
+  }
+  dispose() {
+    for (const session of this.sessions.values()) {
+      try {
+        session.client.end();
+      } catch {
+      }
+    }
+    this.sessions.clear();
+  }
+  requireSession(sessionId) {
+    const session = this.sessions.get(sessionId);
+    if (!session) throw new Error(`SFTP session ${sessionId} not found`);
+    return session;
+  }
+};
+function posixJoin(dir, name) {
+  if (dir.endsWith("/")) return `${dir}${name}`;
+  return `${dir}/${name}`;
+}
+function compareEntries(a, b) {
+  if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
+  return a.name.localeCompare(b.name, void 0, { sensitivity: "base" });
+}
+
+// src/electron/rsync-manager.ts
+var import_child_process7 = require("child_process");
+var import_crypto4 = require("crypto");
+var import_events4 = require("events");
+var import_os7 = __toESM(require("os"), 1);
+var import_path10 = __toESM(require("path"), 1);
+var PROGRESS_LINE = /([\d,]+)\s+(\d+)%\s+([\d.]+\S+)\s+(\d+:\d{2}:\d{2})/;
+function expandHome3(filePath) {
+  if (filePath.startsWith("~/")) return import_path10.default.join(import_os7.default.homedir(), filePath.slice(2));
+  if (filePath === "~") return import_os7.default.homedir();
+  return filePath;
+}
+function buildSshFlag(creds, usingPassword) {
+  const parts = ["ssh", "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=15"];
+  if (!usingPassword) parts.push("-o", "BatchMode=yes");
+  if (creds.port && creds.port !== 22) parts.push("-p", String(creds.port));
+  if (creds.identityFile) parts.push("-i", expandHome3(creds.identityFile));
+  return parts.join(" ");
+}
+function detectSshpass() {
+  try {
+    (0, import_child_process7.execFileSync)("which", ["sshpass"], { stdio: ["ignore", "pipe", "ignore"] });
+    return true;
+  } catch {
+    return false;
+  }
+}
+function detectRsyncMajor() {
+  try {
+    const output = (0, import_child_process7.execFileSync)("rsync", ["--version"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"]
+    });
+    const match = output.match(/version\s+(\d+)\./);
+    return match ? Number(match[1]) : 0;
+  } catch {
+    return 0;
+  }
+}
+function shellQuote(value) {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+var RsyncManager = class extends import_events4.EventEmitter {
+  transfers = /* @__PURE__ */ new Map();
+  sshpassAvailable = null;
+  rsyncMajor = null;
+  isSshpassAvailable() {
+    if (this.sshpassAvailable === null) {
+      this.sshpassAvailable = detectSshpass();
+    }
+    return this.sshpassAvailable;
+  }
+  getRsyncMajor() {
+    if (this.rsyncMajor === null) {
+      this.rsyncMajor = detectRsyncMajor();
+    }
+    return this.rsyncMajor;
+  }
+  list() {
+    return Array.from(this.transfers.values()).map(stripInternal);
+  }
+  async start(host, options) {
+    const creds = resolveCredentials(host);
+    const usingPassword = Boolean(creds.password);
+    if (usingPassword && !this.isSshpassAvailable()) {
+      throw new Error(
+        "This host needs a password, but sshpass is not installed. Install it via `brew install hudochenkov/sshpass/sshpass` or switch to key auth."
+      );
+    }
+    const id = (0, import_crypto4.randomUUID)();
+    const sshFlag = buildSshFlag(creds, usingPassword);
+    const modernRsync = this.getRsyncMajor() >= 3;
+    const remoteSpec = modernRsync ? `${creds.username}@${creds.hostname}:${options.remotePath}` : `${creds.username}@${creds.hostname}:${shellQuote(options.remotePath)}`;
+    const rsyncArgs = ["-a"];
+    if (modernRsync) {
+      rsyncArgs.push("--info=progress2", "--protect-args");
+    } else {
+      rsyncArgs.push("--progress");
+    }
+    rsyncArgs.push("--partial", "-e", sshFlag);
+    if (options.compress) rsyncArgs.push("--compress");
+    if (options.mirror) rsyncArgs.push("--delete");
+    if (options.dryRun) rsyncArgs.push("--dry-run");
+    if (options.direction === "upload") {
+      rsyncArgs.push(options.localPath, remoteSpec);
+    } else {
+      rsyncArgs.push(remoteSpec, options.localPath);
+    }
+    let command;
+    let args;
+    let env = { ...process.env };
+    if (usingPassword) {
+      command = "sshpass";
+      args = ["-e", "rsync", ...rsyncArgs];
+      env = { ...env, SSHPASS: creds.password };
+    } else {
+      command = "rsync";
+      args = rsyncArgs;
+    }
+    const child = (0, import_child_process7.spawn)(command, args, { env });
+    const transfer = {
+      id,
+      hostId: host.id,
+      hostAlias: host.alias,
+      direction: options.direction,
+      localPath: options.localPath,
+      remotePath: options.remotePath,
+      options,
+      state: "running",
+      bytesTransferred: 0,
+      percent: 0,
+      bytesPerSecond: 0,
+      eta: "",
+      log: [],
+      stderr: "",
+      command: `${command} ${args.join(" ")}`,
+      startedAt: Date.now(),
+      process: child,
+      stdoutBuffer: ""
+    };
+    this.transfers.set(id, transfer);
+    this.emit("progress", stripInternal(transfer));
+    child.stdout?.on("data", (chunk) => this.handleStdout(transfer, chunk));
+    child.stderr?.on("data", (chunk) => this.handleStderr(transfer, chunk));
+    child.on("error", (err) => {
+      transfer.state = "error";
+      transfer.error = err.message;
+      transfer.finishedAt = Date.now();
+      this.emit("done", stripInternal(transfer));
+      this.transfers.delete(id);
+    });
+    child.on("close", (code) => {
+      if (transfer.state === "cancelled") {
+        transfer.finishedAt = Date.now();
+        transfer.exitCode = code ?? void 0;
+        this.emit("done", stripInternal(transfer));
+        this.transfers.delete(id);
+        return;
+      }
+      transfer.exitCode = code ?? void 0;
+      transfer.finishedAt = Date.now();
+      if (code === 0) {
+        transfer.state = "done";
+        transfer.percent = 100;
+      } else {
+        transfer.state = "error";
+        transfer.error = transfer.stderr.trim() || `rsync exited with code ${code}`;
+      }
+      this.emit("done", stripInternal(transfer));
+      this.transfers.delete(id);
+    });
+    return { transferId: id };
+  }
+  cancel(transferId) {
+    const transfer = this.transfers.get(transferId);
+    if (!transfer) return false;
+    transfer.state = "cancelled";
+    try {
+      transfer.process.kill("SIGINT");
+    } catch {
+    }
+    setTimeout(() => {
+      const stale = this.transfers.get(transferId);
+      if (stale && !stale.process.killed) {
+        try {
+          stale.process.kill("SIGKILL");
+        } catch {
+        }
+      }
+    }, 2e3);
+    return true;
+  }
+  dispose() {
+    for (const transfer of this.transfers.values()) {
+      try {
+        transfer.process.kill("SIGKILL");
+      } catch {
+      }
+    }
+    this.transfers.clear();
+  }
+  handleStdout(transfer, chunk) {
+    transfer.stdoutBuffer += chunk.toString("utf8");
+    const segments = transfer.stdoutBuffer.split(/[\r\n]+/);
+    transfer.stdoutBuffer = segments.pop() ?? "";
+    for (const segment of segments) {
+      const trimmed = segment.trim();
+      if (!trimmed) continue;
+      const match = trimmed.match(PROGRESS_LINE);
+      if (match) {
+        transfer.bytesTransferred = Number(match[1].replace(/,/g, ""));
+        transfer.percent = Number(match[2]);
+        transfer.bytesPerSecond = parseRate(match[3]);
+        transfer.eta = match[4];
+        this.emit("progress", stripInternal(transfer));
+      } else {
+        transfer.log.push(trimmed);
+        if (transfer.log.length > 50) transfer.log.shift();
+      }
+    }
+  }
+  handleStderr(transfer, chunk) {
+    transfer.stderr += chunk.toString("utf8");
+    if (transfer.stderr.length > 4e3) {
+      transfer.stderr = transfer.stderr.slice(-4e3);
+    }
+    this.emit("progress", stripInternal(transfer));
+  }
+};
+function stripInternal(transfer) {
+  const { process: _process, stdoutBuffer: _stdout, ...rest } = transfer;
+  return rest;
+}
+function parseRate(token) {
+  const match = token.match(/^([\d.]+)([kMG]?B)\/s$/);
+  if (!match) return 0;
+  const value = Number(match[1]);
+  const unit = match[2];
+  const multiplier = unit === "GB" ? 1024 ** 3 : unit === "MB" ? 1024 ** 2 : unit === "kB" ? 1024 : 1;
+  return value * multiplier;
+}
+
+// src/electron/rdp-hosts.ts
+var rowToHost2 = (row) => ({
+  id: row.id,
+  label: row.label,
+  hostname: row.hostname,
+  port: row.port,
+  username: row.username,
+  hasPassword: Boolean(row.password_encrypted && row.password_encrypted.length > 0),
+  domain: row.domain ?? void 0,
+  color: row.color ?? void 0,
+  notes: row.notes ?? void 0,
+  extraArgs: row.extra_args ?? void 0,
+  createdAt: row.created_at,
+  updatedAt: row.updated_at
+});
+var selectAll2 = `
+    SELECT id, label, hostname, port, username, password_encrypted,
+           domain, color, notes, extra_args, created_at, updated_at
+    FROM rdp_hosts
+    ORDER BY label COLLATE NOCASE ASC
+`;
+var selectById2 = `
+    SELECT id, label, hostname, port, username, password_encrypted,
+           domain, color, notes, extra_args, created_at, updated_at
+    FROM rdp_hosts WHERE id = $id
+`;
+function rowsFromStmt2(sql, params = []) {
+  const db2 = getDb();
+  const stmt = db2.prepare(sql);
+  try {
+    stmt.bind(params);
+    const result = [];
+    while (stmt.step()) {
+      result.push(stmt.getAsObject());
+    }
+    return result;
+  } finally {
+    stmt.free();
+  }
+}
+function listRdpHosts() {
+  return rowsFromStmt2(selectAll2).map(rowToHost2);
+}
+function getRdpHost(id) {
+  const rows = rowsFromStmt2(selectById2, { $id: id });
+  return rows[0] ? rowToHost2(rows[0]) : null;
+}
+function getRdpHostPassword(id) {
+  const rows = rowsFromStmt2(selectById2, { $id: id });
+  if (!rows[0]) return null;
+  const blob = rows[0].password_encrypted;
+  if (!blob) return null;
+  return decryptPassword(Buffer.from(blob));
+}
+async function createRdpHost(input) {
+  const db2 = getDb();
+  const now = Date.now();
+  const encrypted = input.password ? encryptPassword(input.password) : null;
+  const port = input.port ?? 3389;
+  db2.run(
+    `INSERT INTO rdp_hosts
+            (label, hostname, port, username, password_encrypted, domain, color, notes, extra_args, created_at, updated_at)
+         VALUES ($label, $hostname, $port, $username, $pwd, $domain, $color, $notes, $extra, $created, $updated)`,
+    {
+      $label: input.label,
+      $hostname: input.hostname,
+      $port: port,
+      $username: input.username,
+      $pwd: encrypted ?? null,
+      $domain: input.domain ?? null,
+      $color: input.color ?? null,
+      $notes: input.notes ?? null,
+      $extra: input.extraArgs ?? null,
+      $created: now,
+      $updated: now
+    }
+  );
+  const result = db2.exec("SELECT last_insert_rowid() AS id");
+  const id = Number(result[0]?.values[0]?.[0] ?? 0);
+  await persist();
+  return getRdpHost(id);
+}
+async function updateRdpHost(id, input) {
+  const db2 = getDb();
+  const now = Date.now();
+  const port = input.port ?? 3389;
+  const shouldUpdatePassword = input.password !== void 0 && input.password !== null;
+  const newEncrypted = shouldUpdatePassword && input.password !== "" ? encryptPassword(input.password) : null;
+  if (shouldUpdatePassword) {
+    db2.run(
+      `UPDATE rdp_hosts SET
+                label=$label, hostname=$hostname, port=$port, username=$username,
+                password_encrypted=$pwd, domain=$domain, color=$color, notes=$notes,
+                extra_args=$extra, updated_at=$updated
+             WHERE id=$id`,
+      {
+        $id: id,
+        $label: input.label,
+        $hostname: input.hostname,
+        $port: port,
+        $username: input.username,
+        $pwd: newEncrypted ?? null,
+        $domain: input.domain ?? null,
+        $color: input.color ?? null,
+        $notes: input.notes ?? null,
+        $extra: input.extraArgs ?? null,
+        $updated: now
+      }
+    );
+  } else {
+    db2.run(
+      `UPDATE rdp_hosts SET
+                label=$label, hostname=$hostname, port=$port, username=$username,
+                domain=$domain, color=$color, notes=$notes,
+                extra_args=$extra, updated_at=$updated
+             WHERE id=$id`,
+      {
+        $id: id,
+        $label: input.label,
+        $hostname: input.hostname,
+        $port: port,
+        $username: input.username,
+        $domain: input.domain ?? null,
+        $color: input.color ?? null,
+        $notes: input.notes ?? null,
+        $extra: input.extraArgs ?? null,
+        $updated: now
+      }
+    );
+  }
+  await persist();
+  return getRdpHost(id);
+}
+async function deleteRdpHost(id) {
+  const db2 = getDb();
+  db2.run("DELETE FROM rdp_hosts WHERE id = $id", { $id: id });
+  await persist();
+  return true;
+}
+
+// src/electron/rdp-manager.ts
+var import_child_process8 = require("child_process");
+var import_crypto5 = require("crypto");
+var import_events5 = require("events");
+function detectBinary() {
+  for (const candidate of ["sdl-freerdp3", "sdl-freerdp", "xfreerdp3", "xfreerdp"]) {
+    try {
+      (0, import_child_process8.execFileSync)("which", [candidate], { stdio: ["ignore", "pipe", "ignore"] });
+      return candidate;
+    } catch {
+    }
+  }
+  return null;
+}
+var RdpManager = class extends import_events5.EventEmitter {
+  sessions = /* @__PURE__ */ new Map();
+  binary;
+  getBinary() {
+    if (this.binary === void 0) {
+      this.binary = detectBinary();
+    }
+    return this.binary;
+  }
+  isAvailable() {
+    return this.getBinary() !== null;
+  }
+  list() {
+    return Array.from(this.sessions.values()).map((session) => ({
+      id: session.id,
+      hostId: session.hostId,
+      label: session.label,
+      hostname: session.hostname,
+      port: session.port,
+      pid: session.pid,
+      startedAt: session.startedAt
+    }));
+  }
+  async connect(hostId) {
+    const binary = this.getBinary();
+    if (!binary) {
+      throw new Error(
+        "xfreerdp is not installed. Run `brew install freerdp` and restart the app."
+      );
+    }
+    const host = getRdpHost(hostId);
+    if (!host) throw new Error(`RDP host ${hostId} not found`);
+    const password = getRdpHostPassword(hostId);
+    const args = buildArgs(host, password);
+    const child = (0, import_child_process8.spawn)(binary, args, {
+      detached: true,
+      stdio: ["ignore", "ignore", "pipe"]
+    });
+    if (typeof child.unref === "function") child.unref();
+    const id = (0, import_crypto5.randomUUID)();
+    const session = {
+      id,
+      hostId: host.id,
+      label: host.label,
+      hostname: host.hostname,
+      port: host.port,
+      pid: child.pid ?? -1,
+      startedAt: Date.now(),
+      process: child,
+      stderrBuffer: ""
+    };
+    this.sessions.set(id, session);
+    this.emit("active-changed", this.list());
+    child.stderr?.on("data", (chunk) => {
+      session.stderrBuffer += chunk.toString("utf8");
+      if (session.stderrBuffer.length > 4e3) {
+        session.stderrBuffer = session.stderrBuffer.slice(-4e3);
+      }
+    });
+    child.on("error", (err) => {
+      this.sessions.delete(id);
+      this.emit("active-changed", this.list());
+      this.emit("exit", {
+        sessionId: id,
+        hostId: host.id,
+        error: err.message,
+        stderr: session.stderrBuffer
+      });
+    });
+    child.on("close", (code) => {
+      this.sessions.delete(id);
+      this.emit("active-changed", this.list());
+      this.emit("exit", {
+        sessionId: id,
+        hostId: host.id,
+        exitCode: code,
+        stderr: session.stderrBuffer
+      });
+    });
+    return { sessionId: id };
+  }
+  disconnect(sessionId) {
+    const session = this.sessions.get(sessionId);
+    if (!session) return false;
+    try {
+      session.process.kill("SIGTERM");
+    } catch {
+    }
+    setTimeout(() => {
+      if (this.sessions.has(sessionId)) {
+        try {
+          session.process.kill("SIGKILL");
+        } catch {
+        }
+      }
+    }, 2e3);
+    return true;
+  }
+  dispose() {
+    for (const session of this.sessions.values()) {
+      try {
+        session.process.kill("SIGTERM");
+      } catch {
+      }
+    }
+    this.sessions.clear();
+  }
+};
+function buildArgs(host, password) {
+  const args = [];
+  args.push(`/v:${host.hostname}:${host.port}`);
+  args.push(`/u:${host.username}`);
+  if (host.domain) args.push(`/d:${host.domain}`);
+  if (password) args.push(`/p:${password}`);
+  args.push("/cert:ignore", "+clipboard", "/dynamic-resolution");
+  if (host.extraArgs) {
+    const tokens = host.extraArgs.split(/\s+/).map((token) => token.trim()).filter(Boolean);
+    args.push(...tokens);
+  }
+  return args;
+}
+
+// src/electron/disk-scanner.ts
+var import_fs7 = require("fs");
+var import_promises6 = require("fs/promises");
+var import_path11 = __toESM(require("path"), 1);
+var import_events6 = require("events");
+var SKIP_BASENAMES = /* @__PURE__ */ new Set([
+  ".Spotlight-V100",
+  ".Trashes",
+  ".fseventsd",
+  ".DocumentRevisions-V100",
+  ".TemporaryItems",
+  ".MobileBackups",
+  ".PKInstallSandboxManager",
+  ".HFS+ Private Directory Data"
+]);
+var SKIP_PATH_PREFIXES = [
+  "/dev",
+  "/Volumes",
+  "/private/var/folders",
+  "/.vol",
+  "/System/Volumes/VM",
+  "/System/Volumes/Preboot",
+  "/System/Volumes/Update"
+];
+var SKIP_PATH_CONTAINS = [
+  "/Library/Mobile Documents",
+  "/.MobileBackups",
+  "/.PreviousSystemInformation",
+  "/Library/Application Support/MobileSync",
+  "/Library/CloudStorage"
+];
+function shouldSkip(filePath, basename) {
+  if (SKIP_BASENAMES.has(basename)) return true;
+  for (const prefix of SKIP_PATH_PREFIXES) {
+    if (filePath === prefix || filePath.startsWith(prefix + "/")) return true;
+  }
+  for (const fragment of SKIP_PATH_CONTAINS) {
+    if (filePath.includes(fragment)) return true;
+  }
+  return false;
+}
+var KEEP_DEPTH = 12;
+var PROGRESS_EVERY_PATHS = 250;
+var FS_TIMEOUT_MS = 5e3;
+var MAX_CONCURRENT_FS = 32;
+var Semaphore = class {
+  active = 0;
+  waiters = [];
+  max;
+  constructor(max) {
+    this.max = max;
+  }
+  async acquire() {
+    if (this.active >= this.max) {
+      await new Promise((resolve) => this.waiters.push(resolve));
+    }
+    this.active += 1;
+  }
+  release() {
+    this.active -= 1;
+    const next = this.waiters.shift();
+    if (next) next();
+  }
+};
+async function withTimeout(promise, ms) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve(null), ms);
+      })
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+function emitProgress(ctx) {
+  ctx.emitter.emit("progress", {
+    pathsSeen: ctx.pathsSeen,
+    bytesSoFar: ctx.bytesSoFar
+  });
+}
+var CancelledError = class extends Error {
+  constructor() {
+    super("cancelled");
+    this.name = "CancelledError";
+  }
+};
+async function walk(dirPath, depth, ctx) {
+  if (ctx.cancelled.value) throw new CancelledError();
+  const baseName = import_path11.default.basename(dirPath) || dirPath;
+  if (depth > 0 && shouldSkip(dirPath, baseName)) {
+    return { name: baseName, path: dirPath, size: 0, isDir: true };
+  }
+  ctx.pathsSeen += 1;
+  if (ctx.pathsSeen % PROGRESS_EVERY_PATHS === 0) emitProgress(ctx);
+  let filesBytes = 0;
+  const subdirPaths = [];
+  await ctx.sem.acquire();
+  try {
+    const dir = await withTimeout((0, import_promises6.opendir)(dirPath), FS_TIMEOUT_MS);
+    if (!dir) {
+      return { name: baseName, path: dirPath, size: 0, isDir: true };
+    }
+    try {
+      for await (const entry of dir) {
+        if (ctx.cancelled.value) break;
+        if (entry.isSymbolicLink()) continue;
+        const full = import_path11.default.join(dirPath, entry.name);
+        if (shouldSkip(full, entry.name)) continue;
+        if (entry.isDirectory()) {
+          subdirPaths.push(full);
+        } else if (entry.isFile()) {
+          const stats = await withTimeout((0, import_promises6.lstat)(full), FS_TIMEOUT_MS);
+          if (stats) {
+            filesBytes += stats.size;
+            ctx.bytesSoFar += stats.size;
+          }
+        }
+      }
+    } catch {
+    }
+  } catch {
+  } finally {
+    ctx.sem.release();
+  }
+  if (ctx.cancelled.value) throw new CancelledError();
+  const children2 = await Promise.all(
+    subdirPaths.map((p) => walk(p, depth + 1, ctx))
+  );
+  const subSize = children2.reduce((sum, child) => sum + child.size, 0);
+  const totalSize = filesBytes + subSize;
+  if (depth >= KEEP_DEPTH) {
+    return { name: baseName, path: dirPath, size: totalSize, isDir: true };
+  }
+  const kept = children2.filter((child) => child.size > 0);
+  if (filesBytes > 0) {
+    kept.push({
+      name: "(files)",
+      path: `${dirPath}/.files`,
+      size: filesBytes,
+      isDir: false
+    });
+  }
+  kept.sort((a, b) => b.size - a.size);
+  return {
+    name: baseName,
+    path: dirPath,
+    size: totalSize,
+    isDir: true,
+    children: kept
+  };
+}
+var DiskScanner = class extends import_events6.EventEmitter {
+  currentCancel = null;
+  isScanning() {
+    return this.currentCancel !== null;
+  }
+  cancel() {
+    if (this.currentCancel) this.currentCancel.value = true;
+    this.currentCancel = null;
+  }
+  resolveRoot(requested) {
+    if (!requested || requested === "/") {
+      if ((0, import_fs7.existsSync)("/System/Volumes/Data")) return "/System/Volumes/Data";
+    }
+    return requested;
+  }
+  async scan(rootPath) {
+    this.cancel();
+    const resolvedRoot = this.resolveRoot(rootPath);
+    const cancelled = { value: false };
+    this.currentCancel = cancelled;
+    const ctx = {
+      sem: new Semaphore(MAX_CONCURRENT_FS),
+      cancelled,
+      pathsSeen: 0,
+      bytesSoFar: 0,
+      emitter: this
+    };
+    try {
+      const tree = await walk(resolvedRoot, 0, ctx);
+      emitProgress(ctx);
+      return tree;
+    } catch (err) {
+      if (err instanceof CancelledError) return null;
+      throw err;
+    } finally {
+      if (this.currentCancel === cancelled) this.currentCancel = null;
+    }
+  }
+};
+
 // main.js
 var EXTRA_PATHS = [
   "/opt/homebrew/bin",
   "/opt/homebrew/sbin",
   "/usr/local/bin",
   "/usr/local/sbin",
-  import_path7.default.join(import_os5.default.homedir(), ".docker/bin"),
+  import_path12.default.join(import_os8.default.homedir(), ".docker/bin"),
   "/Applications/Docker.app/Contents/Resources/bin"
 ];
 process.env.PATH = [...EXTRA_PATHS, process.env.PATH ?? ""].filter(Boolean).join(":");
-var __dirname2 = import_path7.default.dirname((0, import_url2.fileURLToPath)(__cjs_meta_url));
+if (!process.env.UV_THREADPOOL_SIZE) {
+  process.env.UV_THREADPOOL_SIZE = "32";
+}
+var __dirname2 = import_path12.default.dirname((0, import_url2.fileURLToPath)(__cjs_meta_url));
 var devServerUrl = process.env.VITE_DEV_SERVER_URL;
 var isDev = Boolean(devServerUrl);
-var preloadPath = import_electron4.app.isPackaged ? import_path7.default.join(__dirname2, "preload.cjs") : import_path7.default.join(__dirname2, "src", "electron", "preload.cjs");
-var rendererIndex = import_electron4.app.isPackaged ? import_path7.default.join(__dirname2, "..", "dist", "index.html") : import_path7.default.join(__dirname2, "dist", "index.html");
+var preloadPath = import_electron5.app.isPackaged ? import_path12.default.join(__dirname2, "preload.cjs") : import_path12.default.join(__dirname2, "src", "electron", "preload.cjs");
+var rendererIndex = import_electron5.app.isPackaged ? import_path12.default.join(__dirname2, "..", "dist", "index.html") : import_path12.default.join(__dirname2, "dist", "index.html");
 var mainWindow;
 var popupWindow;
 var tray;
 var isQuitting = false;
 var bluetoothManager;
+var registeredHotkey = null;
+var hotkeyError = null;
 var POPUP_WIDTH = 380;
 var POPUP_HEIGHT = 560;
 var mediaManager = new MediaManager();
@@ -13617,6 +14845,15 @@ var systemMonitor = new SystemMonitor();
 var mediaTracker = new MediaTracker(mediaManager);
 var sshManager = new SshManager();
 var dockerManager = new DockerManager();
+var sftpManager = new SftpManager();
+var rsyncManager = new RsyncManager();
+var rdpManager = new RdpManager();
+var diskScanner = new DiskScanner();
+diskScanner.on("progress", (payload) => broadcast("disk:scan-progress", payload));
+rsyncManager.on("progress", (payload) => broadcast("transfer:progress", payload));
+rsyncManager.on("done", (payload) => broadcast("transfer:done", payload));
+rdpManager.on("active-changed", (payload) => broadcast("rdp:active-changed", payload));
+rdpManager.on("exit", (payload) => broadcast("rdp:session-exit", payload));
 var rendererWindows = /* @__PURE__ */ new Set();
 var detachedSessions = /* @__PURE__ */ new Map();
 function registerRendererWindow(win) {
@@ -13654,7 +14891,7 @@ async function waitForDevServer(url) {
   }
 }
 async function createMainWindow() {
-  mainWindow = new import_electron4.BrowserWindow({
+  mainWindow = new import_electron5.BrowserWindow({
     width: 1280,
     height: 720,
     center: true,
@@ -13691,17 +14928,24 @@ function showMainWindow() {
       mainWindow.once("ready-to-show", () => {
         mainWindow.show();
         mainWindow.focus();
-        if (process.platform === "darwin") import_electron4.app.focus({ steal: true });
+        if (process.platform === "darwin") import_electron5.app.focus({ steal: true });
       });
     });
     return;
   }
   mainWindow.show();
   mainWindow.focus();
-  if (process.platform === "darwin") import_electron4.app.focus({ steal: true });
+  if (process.platform === "darwin") import_electron5.app.focus({ steal: true });
+}
+async function ensurePopupWindow() {
+  if (popupWindow && !popupWindow.isDestroyed()) return;
+  await createPopupWindow();
+  if (popupWindow && !popupWindow.isVisible()) {
+    await new Promise((resolve) => popupWindow.once("ready-to-show", resolve));
+  }
 }
 async function createPopupWindow() {
-  popupWindow = new import_electron4.BrowserWindow({
+  popupWindow = new import_electron5.BrowserWindow({
     width: POPUP_WIDTH,
     height: POPUP_HEIGHT,
     show: false,
@@ -13746,7 +14990,7 @@ async function createPopupWindow() {
 function positionPopupNearTray() {
   if (!popupWindow || !tray) return;
   const trayBounds = tray.getBounds();
-  const display = import_electron4.screen.getDisplayNearestPoint({
+  const display = import_electron5.screen.getDisplayNearestPoint({
     x: trayBounds.x,
     y: trayBounds.y
   });
@@ -13756,24 +15000,62 @@ function positionPopupNearTray() {
   const y = Math.round(trayBounds.y + trayBounds.height + 4);
   popupWindow.setBounds({ x, y, width: POPUP_WIDTH, height: POPUP_HEIGHT });
 }
-function togglePopup() {
-  if (!popupWindow || popupWindow.isDestroyed()) return;
-  if (popupWindow.isVisible()) {
+async function togglePopup() {
+  if (popupWindow && !popupWindow.isDestroyed() && popupWindow.isVisible()) {
     popupWindow.hide();
     return;
   }
+  await ensurePopupWindow();
+  if (!popupWindow || popupWindow.isDestroyed()) return;
   positionPopupNearTray();
   popupWindow.show();
   popupWindow.focus();
   if (process.platform === "darwin") {
-    import_electron4.app.focus({ steal: true });
+    import_electron5.app.focus({ steal: true });
+  }
+}
+function toggleMainWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    showMainWindow();
+    return;
+  }
+  if (mainWindow.isVisible() && mainWindow.isFocused()) {
+    mainWindow.hide();
+    return;
+  }
+  showMainWindow();
+}
+function applyHotkey(settings) {
+  if (registeredHotkey) {
+    try {
+      import_electron5.globalShortcut.unregister(registeredHotkey);
+    } catch {
+    }
+    registeredHotkey = null;
+  }
+  hotkeyError = null;
+  const hk = settings?.hotkey;
+  if (!hk?.enabled || !hk?.combo) {
+    return { ok: true, registered: false, combo: null, error: null };
+  }
+  try {
+    const ok = import_electron5.globalShortcut.register(hk.combo, () => toggleMainWindow());
+    if (!ok) {
+      hotkeyError = `Shortcut "${hk.combo}" is already taken by another app`;
+      return { ok: false, registered: false, combo: hk.combo, error: hotkeyError };
+    }
+    registeredHotkey = hk.combo;
+    return { ok: true, registered: true, combo: hk.combo, error: null };
+  } catch (err) {
+    hotkeyError = err?.message ?? String(err);
+    return { ok: false, registered: false, combo: hk.combo, error: hotkeyError };
   }
 }
 function createTray() {
-  tray = new import_electron4.Tray(import_electron4.nativeImage.createEmpty());
+  tray = new import_electron5.Tray(import_electron5.nativeImage.createEmpty());
   tray.setTitle("\u25C9");
   tray.setToolTip("Control Center");
-  const buildMenu = () => import_electron4.Menu.buildFromTemplate([
+  const buildMenu = () => import_electron5.Menu.buildFromTemplate([
     { label: "Open popup", click: togglePopup },
     { label: "Open main window", click: showMainWindow },
     { type: "separator" },
@@ -13782,7 +15064,7 @@ function createTray() {
       accelerator: "Command+Q",
       click: () => {
         isQuitting = true;
-        import_electron4.app.quit();
+        import_electron5.app.quit();
       }
     }
   ]);
@@ -13790,7 +15072,7 @@ function createTray() {
   tray.on("right-click", () => tray.popUpContextMenu(buildMenu()));
 }
 async function createDetachedWindow(sessionId, hostMeta) {
-  const win = new import_electron4.BrowserWindow({
+  const win = new import_electron5.BrowserWindow({
     width: 900,
     height: 600,
     title: hostMeta?.alias ? `SSH \xB7 ${hostMeta.alias}` : "SSH Session",
@@ -13825,229 +15107,330 @@ async function createDetachedWindow(sessionId, hostMeta) {
 }
 async function initBluetoothManager() {
   bluetoothManager = new BluetoothManager();
-  bluetoothManager.on("devices-updated", (devices) => {
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send("bluetooth:devices-updated", devices);
-    }
-  });
-  bluetoothManager.on("connection-changed", (data) => {
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send("bluetooth:connection-changed", data);
-    }
-  });
-  bluetoothManager.on("battery-updated", (data) => {
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send("bluetooth:battery-updated", data);
-    }
-  });
-  bluetoothManager.on("error", (error) => {
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send("bluetooth:error", error);
-    }
-  });
-  bluetoothManager.on("scan-started", () => {
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send("bluetooth:scan-started");
-    }
-  });
-  bluetoothManager.on("scan-completed", () => {
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send("bluetooth:scan-completed");
-    }
-  });
+  bluetoothManager.on("devices-updated", (devices) => broadcast("bluetooth:devices-updated", devices));
+  bluetoothManager.on("connection-changed", (data) => broadcast("bluetooth:connection-changed", data));
+  bluetoothManager.on("battery-updated", (data) => broadcast("bluetooth:battery-updated", data));
+  bluetoothManager.on("error", (error) => broadcast("bluetooth:error", error));
+  bluetoothManager.on("scan-started", () => broadcast("bluetooth:scan-started"));
+  bluetoothManager.on("scan-completed", () => broadcast("bluetooth:scan-completed"));
   await bluetoothManager.startMonitoring();
 }
-import_electron4.ipcMain.handle("bluetooth:get-devices", async () => {
-  return await bluetoothManager.getDevices();
+async function whenBluetoothReady() {
+  if (bluetoothManager) return bluetoothManager;
+  for (let i = 0; i < 50; i += 1) {
+    if (bluetoothManager) return bluetoothManager;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return null;
+}
+import_electron5.ipcMain.handle("bluetooth:get-devices", async () => {
+  const mgr = await whenBluetoothReady();
+  if (!mgr) return { connected: [], notConnected: [], timestamp: Date.now() };
+  return await mgr.getDevices();
 });
-import_electron4.ipcMain.handle("bluetooth:connect-device", async (event, address) => {
-  return await bluetoothManager.connectDevice(address);
+import_electron5.ipcMain.handle("bluetooth:connect-device", async (event, address) => {
+  const mgr = await whenBluetoothReady();
+  if (!mgr) return { success: false, error: "Bluetooth not ready" };
+  return await mgr.connectDevice(address);
 });
-import_electron4.ipcMain.handle("bluetooth:disconnect-device", async (event, address) => {
-  return await bluetoothManager.disconnectDevice(address);
+import_electron5.ipcMain.handle("bluetooth:disconnect-device", async (event, address) => {
+  const mgr = await whenBluetoothReady();
+  if (!mgr) return { success: false, error: "Bluetooth not ready" };
+  return await mgr.disconnectDevice(address);
 });
-import_electron4.ipcMain.handle("bluetooth:forget-device", async (event, address) => {
-  return await bluetoothManager.forgetDevice(address);
+import_electron5.ipcMain.handle("bluetooth:forget-device", async (event, address) => {
+  const mgr = await whenBluetoothReady();
+  if (!mgr) return { success: false, error: "Bluetooth not ready" };
+  return await mgr.forgetDevice(address);
 });
-import_electron4.ipcMain.handle("bluetooth:scan-devices", async (event, duration = 5) => {
-  return await bluetoothManager.scanForDevices(duration);
+import_electron5.ipcMain.handle("bluetooth:scan-devices", async (event, duration = 5) => {
+  const mgr = await whenBluetoothReady();
+  if (!mgr) return { success: false, error: "Bluetooth not ready" };
+  return await mgr.scanForDevices(duration);
 });
-import_electron4.ipcMain.handle("bluetooth:get-battery", async (event, address) => {
-  return await bluetoothManager.getBatteryLevel(address);
+import_electron5.ipcMain.handle("bluetooth:get-battery", async (event, address) => {
+  const mgr = await whenBluetoothReady();
+  if (!mgr) return null;
+  return await mgr.getBatteryLevel(address);
 });
-import_electron4.ipcMain.handle("media:get-now-playing", async () => {
+import_electron5.ipcMain.handle("media:get-now-playing", async () => {
   return await mediaManager.getAllNowPlaying();
 });
-import_electron4.ipcMain.handle("media:control", async (event, action, bundleId) => {
+import_electron5.ipcMain.handle("media:control", async (event, action, bundleId) => {
   return await mediaManager.control(action, bundleId);
 });
-import_electron4.ipcMain.handle("media:list-history", async (event, limit) => {
+import_electron5.ipcMain.handle("media:list-history", async (event, limit) => {
   return listHistory(typeof limit === "number" ? limit : 50);
 });
-import_electron4.ipcMain.handle("media:stats", async () => {
+import_electron5.ipcMain.handle("media:stats", async () => {
   return getStats();
 });
-import_electron4.ipcMain.handle("media:clear-history", async () => {
+import_electron5.ipcMain.handle("media:clear-history", async () => {
   await clearHistory();
   return true;
 });
-import_electron4.ipcMain.handle("media:clear-all-stats", async () => {
+import_electron5.ipcMain.handle("media:clear-all-stats", async () => {
   await clearAllStats();
   return true;
 });
-import_electron4.ipcMain.handle("media:list-artists", async (event, limit) => {
+import_electron5.ipcMain.handle("media:list-artists", async (event, limit) => {
   return listArtistGroups(typeof limit === "number" ? limit : 30);
 });
-import_electron4.ipcMain.handle("system:get-metrics", async () => {
+import_electron5.ipcMain.handle("system:get-metrics", async () => {
   return await systemMonitor.getMetrics();
 });
-import_electron4.ipcMain.handle("ssh:list-hosts", async () => {
+import_electron5.ipcMain.handle("system:list-processes", async () => {
+  return await systemMonitor.listAllProcesses();
+});
+import_electron5.ipcMain.handle("system:kill-process", async (event, pid, signal) => {
+  return systemMonitor.killProcess(pid, signal);
+});
+import_electron5.ipcMain.handle("disk:scan", async (event, rootPath, depth) => {
+  return await diskScanner.scan(rootPath || "/", typeof depth === "number" ? depth : 4);
+});
+import_electron5.ipcMain.handle("disk:cancel-scan", async () => {
+  diskScanner.cancel();
+  return true;
+});
+var appIconCache = /* @__PURE__ */ new Map();
+import_electron5.ipcMain.handle("system:get-app-icon", async (event, appPath) => {
+  if (typeof appPath !== "string" || !appPath.endsWith(".app")) {
+    return null;
+  }
+  if (appIconCache.has(appPath)) {
+    return appIconCache.get(appPath);
+  }
+  try {
+    const icon = await import_electron5.app.getFileIcon(appPath, { size: "small" });
+    const dataUrl = icon.toDataURL();
+    appIconCache.set(appPath, dataUrl);
+    return dataUrl;
+  } catch {
+    appIconCache.set(appPath, null);
+    return null;
+  }
+});
+import_electron5.ipcMain.handle("ssh:list-hosts", async () => {
   return await listAllSshHosts();
 });
-import_electron4.ipcMain.handle("ssh:create-session", async (event, host, cols, rows) => {
+import_electron5.ipcMain.handle("ssh:create-session", async (event, host, cols, rows) => {
   return await sshManager.create(host, cols, rows);
 });
-import_electron4.ipcMain.handle("ssh:list-saved", async () => {
+import_electron5.ipcMain.handle("ssh:list-saved", async () => {
   return listSavedHosts();
 });
-import_electron4.ipcMain.handle("ssh:create-saved", async (event, input) => {
+import_electron5.ipcMain.handle("ssh:create-saved", async (event, input) => {
   return await createSavedHost(input);
 });
-import_electron4.ipcMain.handle("ssh:update-saved", async (event, id, input) => {
+import_electron5.ipcMain.handle("ssh:update-saved", async (event, id, input) => {
   return await updateSavedHost(id, input);
 });
-import_electron4.ipcMain.handle("ssh:delete-saved", async (event, id) => {
+import_electron5.ipcMain.handle("ssh:delete-saved", async (event, id) => {
   return await deleteSavedHost(id);
 });
-import_electron4.ipcMain.handle("ssh:encryption-available", async () => {
+import_electron5.ipcMain.handle("ssh:encryption-available", async () => {
   return isCredentialEncryptionAvailable();
 });
-import_electron4.ipcMain.handle("ssh:set-override", async (event, hostId, patch) => {
+import_electron5.ipcMain.handle("ssh:set-override", async (event, hostId, patch) => {
   return await upsertOverride(hostId, patch);
 });
-import_electron4.ipcMain.handle("ssh:delete-override", async (event, hostId) => {
+import_electron5.ipcMain.handle("ssh:delete-override", async (event, hostId) => {
   await deleteOverride(hostId);
   return true;
 });
-import_electron4.ipcMain.handle("ssh:remove-known-host", async (event, hostname) => {
+import_electron5.ipcMain.handle("ssh:remove-known-host", async (event, hostname) => {
   return await removeFromKnownHosts(hostname);
 });
-import_electron4.ipcMain.handle("ssh:list-forwards", async (event, hostId) => {
+import_electron5.ipcMain.handle("ssh:list-forwards", async (event, hostId) => {
   return listPortForwards(hostId);
 });
-import_electron4.ipcMain.handle("ssh:create-forward", async (event, hostId, input) => {
+import_electron5.ipcMain.handle("ssh:create-forward", async (event, hostId, input) => {
   return await createPortForward(hostId, input);
 });
-import_electron4.ipcMain.handle("ssh:update-forward", async (event, id, patch) => {
+import_electron5.ipcMain.handle("ssh:update-forward", async (event, id, patch) => {
   await updatePortForward(id, patch);
   return true;
 });
-import_electron4.ipcMain.handle("ssh:delete-forward", async (event, id) => {
+import_electron5.ipcMain.handle("ssh:delete-forward", async (event, id) => {
   await deletePortForward(id);
   return true;
 });
-import_electron4.ipcMain.handle("ssh:write", async (event, sessionId, data) => {
+import_electron5.ipcMain.handle("ssh:write", async (event, sessionId, data) => {
   if (dockerManager.ownsExec(sessionId)) {
     return dockerManager.writeExec(sessionId, data);
   }
   return sshManager.write(sessionId, data);
 });
-import_electron4.ipcMain.handle("ssh:resize", async (event, sessionId, cols, rows) => {
+import_electron5.ipcMain.handle("ssh:resize", async (event, sessionId, cols, rows) => {
   if (dockerManager.ownsExec(sessionId)) {
     return dockerManager.resizeExec(sessionId, cols, rows);
   }
   return sshManager.resize(sessionId, cols, rows);
 });
-import_electron4.ipcMain.handle("ssh:close-session", async (event, sessionId) => {
+import_electron5.ipcMain.handle("ssh:close-session", async (event, sessionId) => {
   if (dockerManager.ownsExec(sessionId)) {
     return dockerManager.closeExec(sessionId);
   }
   return sshManager.close(sessionId);
 });
-import_electron4.ipcMain.handle("ssh:list-active", async () => {
+import_electron5.ipcMain.handle("ssh:list-active", async () => {
   return sshManager.list();
 });
-import_electron4.ipcMain.handle("app:show-main", async () => {
+import_electron5.ipcMain.handle("app:show-main", async () => {
   showMainWindow();
   if (popupWindow && !popupWindow.isDestroyed()) {
     popupWindow.hide();
   }
   return true;
 });
-import_electron4.ipcMain.handle("app:hide-popup", async () => {
+import_electron5.ipcMain.handle("app:hide-popup", async () => {
   if (popupWindow && !popupWindow.isDestroyed()) {
     popupWindow.hide();
   }
   return true;
 });
-import_electron4.ipcMain.handle("docker:status", async () => {
+import_electron5.ipcMain.handle("settings:get", async () => {
+  return await loadSettings();
+});
+import_electron5.ipcMain.handle("settings:update", async (event, patch) => {
+  const next = await updateSettings(patch);
+  if (patch?.hotkey) applyHotkey(next);
+  broadcast("settings:changed", next);
+  return next;
+});
+import_electron5.ipcMain.handle("hotkey:status", () => ({
+  registered: Boolean(registeredHotkey),
+  combo: registeredHotkey,
+  error: hotkeyError
+}));
+import_electron5.ipcMain.handle("db:get-stats", async () => {
+  return await getDbStats();
+});
+import_electron5.ipcMain.handle("db:clear-tables", async (event, groups) => {
+  return await clearTables(Array.isArray(groups) ? groups : []);
+});
+import_electron5.ipcMain.handle("files:local-home", async () => {
+  return localHome();
+});
+import_electron5.ipcMain.handle("files:local-list", async (event, dirPath) => {
+  return await listLocal(dirPath);
+});
+import_electron5.ipcMain.handle("files:remote-connect", async (event, host) => {
+  return await sftpManager.connect(host);
+});
+import_electron5.ipcMain.handle("files:remote-list", async (event, sessionId, dirPath) => {
+  return await sftpManager.list(sessionId, dirPath);
+});
+import_electron5.ipcMain.handle("files:remote-disconnect", async (event, sessionId) => {
+  return sftpManager.disconnect(sessionId);
+});
+import_electron5.ipcMain.handle("transfer:start", async (event, hostId, options) => {
+  const all = await listAllSshHosts();
+  const host = [...all.visible, ...all.hidden].find((h) => h.id === hostId);
+  if (!host) throw new Error(`Host ${hostId} not found`);
+  return await rsyncManager.start(host, options);
+});
+import_electron5.ipcMain.handle("transfer:cancel", async (event, transferId) => {
+  return rsyncManager.cancel(transferId);
+});
+import_electron5.ipcMain.handle("transfer:list", async () => {
+  return rsyncManager.list();
+});
+import_electron5.ipcMain.handle("transfer:sshpass-available", async () => {
+  return rsyncManager.isSshpassAvailable();
+});
+import_electron5.ipcMain.handle("rdp:list", async () => {
+  return listRdpHosts();
+});
+import_electron5.ipcMain.handle("rdp:create", async (event, input) => {
+  return await createRdpHost(input);
+});
+import_electron5.ipcMain.handle("rdp:update", async (event, id, input) => {
+  return await updateRdpHost(id, input);
+});
+import_electron5.ipcMain.handle("rdp:delete", async (event, id) => {
+  return await deleteRdpHost(id);
+});
+import_electron5.ipcMain.handle("rdp:connect", async (event, hostId) => {
+  return await rdpManager.connect(hostId);
+});
+import_electron5.ipcMain.handle("rdp:disconnect", async (event, sessionId) => {
+  return rdpManager.disconnect(sessionId);
+});
+import_electron5.ipcMain.handle("rdp:list-active", async () => {
+  return rdpManager.list();
+});
+import_electron5.ipcMain.handle("rdp:available", async () => {
+  return { available: rdpManager.isAvailable(), binary: rdpManager.getBinary() };
+});
+import_electron5.ipcMain.handle("docker:status", async () => {
   return dockerManager.isAvailable();
 });
-import_electron4.ipcMain.handle("docker:list-containers", async () => {
+import_electron5.ipcMain.handle("docker:list-containers", async () => {
   return dockerManager.listContainers();
 });
-import_electron4.ipcMain.handle("docker:list-images", async () => {
+import_electron5.ipcMain.handle("docker:list-images", async () => {
   return dockerManager.listImages();
 });
-import_electron4.ipcMain.handle("docker:list-volumes", async () => {
+import_electron5.ipcMain.handle("docker:list-volumes", async () => {
   return dockerManager.listVolumes();
 });
-import_electron4.ipcMain.handle("docker:list-networks", async () => {
+import_electron5.ipcMain.handle("docker:list-networks", async () => {
   return dockerManager.listNetworks();
 });
-import_electron4.ipcMain.handle("docker:run-image", async (event, options) => {
+import_electron5.ipcMain.handle("docker:run-image", async (event, options) => {
   return dockerManager.runImage(options);
 });
-import_electron4.ipcMain.handle("docker:start-container", async (event, id) => {
+import_electron5.ipcMain.handle("docker:start-container", async (event, id) => {
   await dockerManager.startContainer(id);
   return true;
 });
-import_electron4.ipcMain.handle("docker:stop-container", async (event, id) => {
+import_electron5.ipcMain.handle("docker:stop-container", async (event, id) => {
   await dockerManager.stopContainer(id);
   return true;
 });
-import_electron4.ipcMain.handle("docker:restart-container", async (event, id) => {
+import_electron5.ipcMain.handle("docker:restart-container", async (event, id) => {
   await dockerManager.restartContainer(id);
   return true;
 });
-import_electron4.ipcMain.handle("docker:remove-container", async (event, id, force) => {
+import_electron5.ipcMain.handle("docker:remove-container", async (event, id, force) => {
   await dockerManager.removeContainer(id, Boolean(force));
   return true;
 });
-import_electron4.ipcMain.handle("docker:remove-image", async (event, id, force) => {
+import_electron5.ipcMain.handle("docker:remove-image", async (event, id, force) => {
   await dockerManager.removeImage(id, Boolean(force));
   return true;
 });
-import_electron4.ipcMain.handle("docker:remove-volume", async (event, name, force) => {
+import_electron5.ipcMain.handle("docker:remove-volume", async (event, name, force) => {
   await dockerManager.removeVolume(name, Boolean(force));
   return true;
 });
-import_electron4.ipcMain.handle("docker:remove-network", async (event, name) => {
+import_electron5.ipcMain.handle("docker:remove-network", async (event, name) => {
   await dockerManager.removeNetwork(name);
   return true;
 });
-import_electron4.ipcMain.handle("docker:prune-containers", async () => {
+import_electron5.ipcMain.handle("docker:prune-containers", async () => {
   return dockerManager.pruneContainers();
 });
-import_electron4.ipcMain.handle("docker:prune-images", async (event, all) => {
+import_electron5.ipcMain.handle("docker:prune-images", async (event, all) => {
   return dockerManager.pruneImages(Boolean(all));
 });
-import_electron4.ipcMain.handle("docker:prune-volumes", async () => {
+import_electron5.ipcMain.handle("docker:prune-volumes", async () => {
   return dockerManager.pruneVolumes();
 });
-import_electron4.ipcMain.handle("docker:prune-networks", async () => {
+import_electron5.ipcMain.handle("docker:prune-networks", async () => {
   return dockerManager.pruneNetworks();
 });
-import_electron4.ipcMain.handle("docker:prune-system", async (event, all) => {
+import_electron5.ipcMain.handle("docker:prune-system", async (event, all) => {
   return dockerManager.pruneSystem(Boolean(all));
 });
-import_electron4.ipcMain.handle("docker:logs", async (event, id, tail) => {
+import_electron5.ipcMain.handle("docker:logs", async (event, id, tail) => {
   return dockerManager.getLogs(id, typeof tail === "number" ? tail : 500);
 });
-import_electron4.ipcMain.handle("docker:exec-start", async (event, containerId, containerName, cols, rows) => {
+import_electron5.ipcMain.handle("docker:exec-start", async (event, containerId, containerName, cols, rows) => {
   return dockerManager.startExec(containerId, containerName, cols, rows);
 });
-import_electron4.ipcMain.handle("ssh:detach-session", async (event, sessionId, hostMeta) => {
+import_electron5.ipcMain.handle("ssh:detach-session", async (event, sessionId, hostMeta) => {
   if (detachedSessions.has(sessionId)) {
     const existing = detachedSessions.get(sessionId);
     if (!existing.isDestroyed()) existing.focus();
@@ -14058,23 +15441,24 @@ import_electron4.ipcMain.handle("ssh:detach-session", async (event, sessionId, h
 });
 function logFatal(stage, err) {
   try {
-    const logPath = import_path7.default.join(import_electron4.app.getPath("userData"), "fatal.log");
+    const logPath = import_path12.default.join(import_electron5.app.getPath("userData"), "fatal.log");
     const line = `[${(/* @__PURE__ */ new Date()).toISOString()}] ${stage}: ${err?.stack ?? err}
 `;
-    (0, import_fs4.appendFileSync)(logPath, line);
+    (0, import_fs8.appendFileSync)(logPath, line);
   } catch {
     console.error(stage, err);
   }
 }
 process.on("uncaughtException", (err) => logFatal("uncaughtException", err));
 process.on("unhandledRejection", (err) => logFatal("unhandledRejection", err));
-import_electron4.app.whenReady().then(async () => {
+import_electron5.app.whenReady().then(async () => {
   try {
     await initDb();
+    const settings = await loadSettings();
     await purgeOldHistory();
     await createMainWindow();
-    await createPopupWindow();
     createTray();
+    applyHotkey(settings);
     initBluetoothManager();
     mediaTracker.start();
   } catch (err) {
@@ -14082,23 +15466,28 @@ import_electron4.app.whenReady().then(async () => {
     throw err;
   }
 });
-import_electron4.app.on("activate", () => {
+import_electron5.app.on("activate", () => {
   showMainWindow();
 });
-import_electron4.app.on("before-quit", () => {
+import_electron5.app.on("before-quit", () => {
   isQuitting = true;
 });
-import_electron4.app.on("window-all-closed", () => {
+import_electron5.app.on("window-all-closed", () => {
   if (process.platform !== "darwin") {
-    import_electron4.app.quit();
+    import_electron5.app.quit();
   }
 });
-import_electron4.app.on("will-quit", async () => {
+import_electron5.app.on("will-quit", async () => {
+  import_electron5.globalShortcut.unregisterAll();
   if (bluetoothManager) {
     bluetoothManager.stopMonitoring();
   }
   sshManager.dispose();
   dockerManager.dispose();
+  sftpManager.dispose();
+  rsyncManager.dispose();
+  rdpManager.dispose();
+  diskScanner.cancel();
   await mediaTracker.stop();
   await closeDb();
 });

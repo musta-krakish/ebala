@@ -1,9 +1,27 @@
-import { existsSync, mkdirSync } from 'fs';
-import { readFile, writeFile } from 'fs/promises';
+import { existsSync, mkdirSync, statSync } from 'fs';
+import { readFile, rename, unlink, writeFile } from 'fs/promises';
 import { createRequire } from 'module';
 import path from 'path';
 import { app } from 'electron';
 import initSqlJs, { type Database } from 'sql.js';
+
+// Logical groups exposed to the settings panel. The right side is the SQL
+// table list cleared when the user picks a group — keeping it here means
+// the renderer never has to know about table names.
+export const DB_TABLE_GROUPS = {
+    sshHosts: ['saved_hosts', 'host_overrides', 'port_forwards'],
+    rdpHosts: ['rdp_hosts'],
+    mediaHistory: ['media_history'],
+    mediaStats: ['media_artist_stats', 'media_track_stats']
+} as const;
+
+export type DbTableGroup = keyof typeof DB_TABLE_GROUPS;
+
+export interface DbStats {
+    sizeBytes: number;
+    path: string;
+    groups: Record<DbTableGroup, { rowCount: number; tables: string[] }>;
+}
 
 const require = createRequire(import.meta.url);
 const DB_FILENAME = 'ebala.db';
@@ -121,12 +139,28 @@ const runMigrations = (database: Database) => {
         );
         CREATE INDEX IF NOT EXISTS idx_media_track_stats_artist ON media_track_stats (artist, total_seconds DESC);
         CREATE INDEX IF NOT EXISTS idx_media_track_stats_total ON media_track_stats (total_seconds DESC);
+
+        CREATE TABLE IF NOT EXISTS rdp_hosts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            label TEXT NOT NULL,
+            hostname TEXT NOT NULL,
+            port INTEGER NOT NULL DEFAULT 3389,
+            username TEXT NOT NULL,
+            password_encrypted BLOB,
+            domain TEXT,
+            color TEXT,
+            notes TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_rdp_hosts_label ON rdp_hosts (label);
     `);
 
     // Forward-compatible migrations for databases created by older versions.
     addColumnIfMissing(database, 'host_overrides', 'username', 'TEXT');
     addColumnIfMissing(database, 'host_overrides', 'password_encrypted', 'BLOB');
     addColumnIfMissing(database, 'host_overrides', 'auth_method', 'TEXT');
+    addColumnIfMissing(database, 'rdp_hosts', 'extra_args', 'TEXT');
 
     // One-time backfill: if the aggregate tables are empty but we have an
     // existing media_history, roll it up so the "By artist" view isn't blank
@@ -164,6 +198,29 @@ const runMigrations = (database: Database) => {
     }
 };
 
+async function openWithFallback(SQL: Awaited<ReturnType<typeof initSqlJs>>, filePath: string): Promise<Database> {
+    if (!existsSync(filePath)) return new SQL.Database();
+
+    const buffer = await readFile(filePath);
+    try {
+        const candidate = new SQL.Database(buffer);
+        // Touch a real query so we surface malformed-image errors here, not
+        // mid-runtime when the user clicks something.
+        candidate.exec('PRAGMA quick_check');
+        return candidate;
+    } catch (err) {
+        const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+        const quarantine = `${filePath}.corrupted-${stamp}`;
+        try {
+            await rename(filePath, quarantine);
+        } catch {
+            // ignore — worst case we overwrite below
+        }
+        console.error(`[db] image malformed (${(err as Error)?.message ?? err}); quarantined to ${quarantine}, starting fresh`);
+        return new SQL.Database();
+    }
+}
+
 export async function initDb(): Promise<Database> {
     if (db) return db;
 
@@ -179,8 +236,7 @@ export async function initDb(): Promise<Database> {
     dbPath = path.join(userData, DB_FILENAME);
 
     if (existsSync(dbPath)) {
-        const buffer = await readFile(dbPath);
-        db = new SQL.Database(buffer);
+        db = await openWithFallback(SQL, dbPath);
     } else {
         db = new SQL.Database();
     }
@@ -199,7 +255,19 @@ export function persist(): Promise<void> {
     persistQueue = persistQueue.then(async () => {
         if (!db || !dbPath) return;
         const data = db.export();
-        await writeFile(dbPath, data);
+        // Atomic swap via tmp + rename — if the process is killed mid-write
+        // (SIGKILL during a long disk scan, etc.) the on-disk file remains
+        // the previous valid version instead of a truncated mess.
+        const tmpPath = `${dbPath}.tmp`;
+        try {
+            await writeFile(tmpPath, data);
+            await rename(tmpPath, dbPath);
+        } catch (err) {
+            // Best-effort cleanup of the partial tmp file so we don't
+            // accumulate `.tmp` corpses next to the db.
+            try { await unlink(tmpPath); } catch { /* ignore */ }
+            throw err;
+        }
     });
     return persistQueue;
 }
@@ -210,4 +278,57 @@ export async function closeDb() {
         db.close();
         db = null;
     }
+}
+
+function countRows(database: Database, tables: string[]): number {
+    let total = 0;
+    for (const table of tables) {
+        const result = database.exec(`SELECT COUNT(*) FROM ${table}`)[0];
+        const value = result?.values?.[0]?.[0];
+        total += typeof value === 'number' ? value : Number(value ?? 0);
+    }
+    return total;
+}
+
+export async function getDbStats(): Promise<DbStats> {
+    const database = getDb();
+    await persistQueue;
+    const sizeBytes = dbPath && existsSync(dbPath) ? statSync(dbPath).size : 0;
+
+    const groups = Object.fromEntries(
+        (Object.entries(DB_TABLE_GROUPS) as [DbTableGroup, readonly string[]][]).map(
+            ([key, tables]) => [key, { rowCount: countRows(database, tables as string[]), tables: [...tables] }]
+        )
+    ) as DbStats['groups'];
+
+    return { sizeBytes, path: dbPath ?? '', groups };
+}
+
+export async function clearTables(groups: DbTableGroup[]): Promise<DbStats> {
+    const database = getDb();
+    const tables = new Set<string>();
+    for (const group of groups) {
+        const list = DB_TABLE_GROUPS[group];
+        if (!list) continue;
+        for (const table of list) tables.add(table);
+    }
+
+    if (tables.size > 0) {
+        database.exec('BEGIN TRANSACTION');
+        try {
+            for (const table of tables) {
+                database.exec(`DELETE FROM ${table}`);
+            }
+            database.exec('COMMIT');
+            // VACUUM has to run outside a transaction — without it the file
+            // size stays the same after a big purge.
+            database.exec('VACUUM');
+        } catch (error) {
+            database.exec('ROLLBACK');
+            throw error;
+        }
+        await persist();
+    }
+
+    return getDbStats();
 }

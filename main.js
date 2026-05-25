@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, Menu, Tray, nativeImage, screen } from 'electron';
+import { app, BrowserWindow, globalShortcut, ipcMain, Menu, Tray, nativeImage, screen } from 'electron';
 import { appendFileSync } from 'fs';
 import os from 'os';
 import path from 'path';
@@ -18,12 +18,21 @@ const EXTRA_PATHS = [
     '/Applications/Docker.app/Contents/Resources/bin'
 ];
 process.env.PATH = [...EXTRA_PATHS, process.env.PATH ?? ''].filter(Boolean).join(':');
+
+// libuv defaults to 4 threads for fs ops — way too few for the disk-usage
+// scanner on a modern SSD. Bump before the runtime initialises the pool
+// (must be set before any fs call). 32 saturates most NVMe drives without
+// piling up too many fds.
+if (!process.env.UV_THREADPOOL_SIZE) {
+    process.env.UV_THREADPOOL_SIZE = '32';
+}
 import { BluetoothManager } from './src/electron/bluetooth-manager.ts';
 import { MediaManager } from './src/electron/media-manager.ts';
 import { SystemMonitor } from './src/electron/system-monitor.ts';
 import { listAllSshHosts } from './src/electron/ssh-hosts.ts';
 import { SshManager } from './src/electron/ssh-manager.ts';
-import { initDb, closeDb } from './src/electron/db.ts';
+import { clearTables, getDbStats, initDb, closeDb } from './src/electron/db.ts';
+import { loadSettings, updateSettings } from './src/electron/settings-store.ts';
 import {
     createSavedHost,
     deleteSavedHost,
@@ -49,6 +58,17 @@ import {
     updatePortForward
 } from './src/electron/port-forwards.ts';
 import { DockerManager } from './src/electron/docker-manager.ts';
+import { listLocal, localHome } from './src/electron/local-fs.ts';
+import { SftpManager } from './src/electron/sftp-manager.ts';
+import { RsyncManager } from './src/electron/rsync-manager.ts';
+import {
+    createRdpHost,
+    deleteRdpHost,
+    listRdpHosts,
+    updateRdpHost
+} from './src/electron/rdp-hosts.ts';
+import { RdpManager } from './src/electron/rdp-manager.ts';
+import { DiskScanner } from './src/electron/disk-scanner.ts';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const devServerUrl = process.env.VITE_DEV_SERVER_URL;
@@ -70,6 +90,8 @@ let popupWindow;
 let tray;
 let isQuitting = false;
 let bluetoothManager;
+let registeredHotkey = null;
+let hotkeyError = null;
 
 const POPUP_WIDTH = 380;
 const POPUP_HEIGHT = 560;
@@ -78,6 +100,16 @@ const systemMonitor = new SystemMonitor();
 const mediaTracker = new MediaTracker(mediaManager);
 const sshManager = new SshManager();
 const dockerManager = new DockerManager();
+const sftpManager = new SftpManager();
+const rsyncManager = new RsyncManager();
+const rdpManager = new RdpManager();
+const diskScanner = new DiskScanner();
+diskScanner.on('progress', (payload) => broadcast('disk:scan-progress', payload));
+
+rsyncManager.on('progress', (payload) => broadcast('transfer:progress', payload));
+rsyncManager.on('done', (payload) => broadcast('transfer:done', payload));
+rdpManager.on('active-changed', (payload) => broadcast('rdp:active-changed', payload));
+rdpManager.on('exit', (payload) => broadcast('rdp:session-exit', payload));
 const rendererWindows = new Set();
 const detachedSessions = new Map(); // sessionId -> BrowserWindow
 
@@ -181,6 +213,16 @@ function showMainWindow() {
     if (process.platform === 'darwin') app.focus({ steal: true });
 }
 
+async function ensurePopupWindow() {
+    if (popupWindow && !popupWindow.isDestroyed()) return;
+    await createPopupWindow();
+    // First load needs to finish before positioning so the panel renders
+    // with the right size — wait for ready-to-show one time.
+    if (popupWindow && !popupWindow.isVisible()) {
+        await new Promise((resolve) => popupWindow.once('ready-to-show', resolve));
+    }
+}
+
 async function createPopupWindow() {
     popupWindow = new BrowserWindow({
         width: POPUP_WIDTH,
@@ -249,19 +291,63 @@ function positionPopupNearTray() {
     popupWindow.setBounds({ x, y, width: POPUP_WIDTH, height: POPUP_HEIGHT });
 }
 
-function togglePopup() {
-    if (!popupWindow || popupWindow.isDestroyed()) return;
-    if (popupWindow.isVisible()) {
+async function togglePopup() {
+    if (popupWindow && !popupWindow.isDestroyed() && popupWindow.isVisible()) {
         popupWindow.hide();
         return;
     }
+    // Lazy-create: not built on startup any more. First open pays ~300 ms
+    // for renderer boot, saving ~120-150 MB resident from the always-on
+    // hidden window.
+    await ensurePopupWindow();
+    if (!popupWindow || popupWindow.isDestroyed()) return;
     positionPopupNearTray();
     popupWindow.show();
     popupWindow.focus();
     if (process.platform === 'darwin') {
-        // Force the popup to surface on whatever Space the user is on right
-        // now (not the one where the window was created).
         app.focus({ steal: true });
+    }
+}
+
+function toggleMainWindow() {
+    if (!mainWindow || mainWindow.isDestroyed()) {
+        showMainWindow();
+        return;
+    }
+    if (mainWindow.isVisible() && mainWindow.isFocused()) {
+        mainWindow.hide();
+        return;
+    }
+    showMainWindow();
+}
+
+function applyHotkey(settings) {
+    if (registeredHotkey) {
+        try {
+            globalShortcut.unregister(registeredHotkey);
+        } catch {
+            // ignore
+        }
+        registeredHotkey = null;
+    }
+    hotkeyError = null;
+
+    const hk = settings?.hotkey;
+    if (!hk?.enabled || !hk?.combo) {
+        return { ok: true, registered: false, combo: null, error: null };
+    }
+
+    try {
+        const ok = globalShortcut.register(hk.combo, () => toggleMainWindow());
+        if (!ok) {
+            hotkeyError = `Shortcut "${hk.combo}" is already taken by another app`;
+            return { ok: false, registered: false, combo: hk.combo, error: hotkeyError };
+        }
+        registeredHotkey = hk.combo;
+        return { ok: true, registered: true, combo: hk.combo, error: null };
+    } catch (err) {
+        hotkeyError = err?.message ?? String(err);
+        return { ok: false, registered: false, combo: hk.combo, error: hotkeyError };
     }
 }
 
@@ -333,68 +419,63 @@ async function createDetachedWindow(sessionId, hostMeta) {
 async function initBluetoothManager() {
     bluetoothManager = new BluetoothManager();
 
-    bluetoothManager.on('devices-updated', (devices) => {
-        if (mainWindow && !mainWindow.isDestroyed()) {
-            mainWindow.webContents.send('bluetooth:devices-updated', devices);
-        }
-    });
-
-    bluetoothManager.on('connection-changed', (data) => {
-        if (mainWindow && !mainWindow.isDestroyed()) {
-            mainWindow.webContents.send('bluetooth:connection-changed', data);
-        }
-    });
-
-    bluetoothManager.on('battery-updated', (data) => {
-        if (mainWindow && !mainWindow.isDestroyed()) {
-            mainWindow.webContents.send('bluetooth:battery-updated', data);
-        }
-    });
-
-    bluetoothManager.on('error', (error) => {
-        if (mainWindow && !mainWindow.isDestroyed()) {
-            mainWindow.webContents.send('bluetooth:error', error);
-        }
-    });
-
-    bluetoothManager.on('scan-started', () => {
-        if (mainWindow && !mainWindow.isDestroyed()) {
-            mainWindow.webContents.send('bluetooth:scan-started');
-        }
-    });
-
-    bluetoothManager.on('scan-completed', () => {
-        if (mainWindow && !mainWindow.isDestroyed()) {
-            mainWindow.webContents.send('bluetooth:scan-completed');
-        }
-    });
+    bluetoothManager.on('devices-updated', (devices) => broadcast('bluetooth:devices-updated', devices));
+    bluetoothManager.on('connection-changed', (data) => broadcast('bluetooth:connection-changed', data));
+    bluetoothManager.on('battery-updated', (data) => broadcast('bluetooth:battery-updated', data));
+    bluetoothManager.on('error', (error) => broadcast('bluetooth:error', error));
+    bluetoothManager.on('scan-started', () => broadcast('bluetooth:scan-started'));
+    bluetoothManager.on('scan-completed', () => broadcast('bluetooth:scan-completed'));
 
     await bluetoothManager.startMonitoring();
 }
 
 // IPC Handlers
+// bluetoothManager is initialised async after whenReady; renderer can call
+// these IPCs before that completes, so guard every handler with a fallback.
+async function whenBluetoothReady() {
+    if (bluetoothManager) return bluetoothManager;
+    // Wait up to 5s for init — beyond that, treat as unavailable.
+    for (let i = 0; i < 50; i += 1) {
+        if (bluetoothManager) return bluetoothManager;
+        await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    return null;
+}
+
 ipcMain.handle('bluetooth:get-devices', async () => {
-    return await bluetoothManager.getDevices();
+    const mgr = await whenBluetoothReady();
+    if (!mgr) return { connected: [], notConnected: [], timestamp: Date.now() };
+    return await mgr.getDevices();
 });
 
 ipcMain.handle('bluetooth:connect-device', async (event, address) => {
-    return await bluetoothManager.connectDevice(address);
+    const mgr = await whenBluetoothReady();
+    if (!mgr) return { success: false, error: 'Bluetooth not ready' };
+    return await mgr.connectDevice(address);
 });
 
 ipcMain.handle('bluetooth:disconnect-device', async (event, address) => {
-    return await bluetoothManager.disconnectDevice(address);
+    const mgr = await whenBluetoothReady();
+    if (!mgr) return { success: false, error: 'Bluetooth not ready' };
+    return await mgr.disconnectDevice(address);
 });
 
 ipcMain.handle('bluetooth:forget-device', async (event, address) => {
-    return await bluetoothManager.forgetDevice(address);
+    const mgr = await whenBluetoothReady();
+    if (!mgr) return { success: false, error: 'Bluetooth not ready' };
+    return await mgr.forgetDevice(address);
 });
 
 ipcMain.handle('bluetooth:scan-devices', async (event, duration = 5) => {
-    return await bluetoothManager.scanForDevices(duration);
+    const mgr = await whenBluetoothReady();
+    if (!mgr) return { success: false, error: 'Bluetooth not ready' };
+    return await mgr.scanForDevices(duration);
 });
 
 ipcMain.handle('bluetooth:get-battery', async (event, address) => {
-    return await bluetoothManager.getBatteryLevel(address);
+    const mgr = await whenBluetoothReady();
+    if (!mgr) return null;
+    return await mgr.getBatteryLevel(address);
 });
 
 ipcMain.handle('media:get-now-playing', async () => {
@@ -429,6 +510,45 @@ ipcMain.handle('media:list-artists', async (event, limit) => {
 
 ipcMain.handle('system:get-metrics', async () => {
     return await systemMonitor.getMetrics();
+});
+
+ipcMain.handle('system:list-processes', async () => {
+    return await systemMonitor.listAllProcesses();
+});
+
+ipcMain.handle('system:kill-process', async (event, pid, signal) => {
+    return systemMonitor.killProcess(pid, signal);
+});
+
+ipcMain.handle('disk:scan', async (event, rootPath, depth) => {
+    return await diskScanner.scan(rootPath || '/', typeof depth === 'number' ? depth : 4);
+});
+
+ipcMain.handle('disk:cancel-scan', async () => {
+    diskScanner.cancel();
+    return true;
+});
+
+// Cache app icons by .app bundle path — getFileIcon does an Icon Services
+// lookup which is comparatively expensive, and the renderer fetches the
+// same paths on every poll.
+const appIconCache = new Map();
+ipcMain.handle('system:get-app-icon', async (event, appPath) => {
+    if (typeof appPath !== 'string' || !appPath.endsWith('.app')) {
+        return null;
+    }
+    if (appIconCache.has(appPath)) {
+        return appIconCache.get(appPath);
+    }
+    try {
+        const icon = await app.getFileIcon(appPath, { size: 'small' });
+        const dataUrl = icon.toDataURL();
+        appIconCache.set(appPath, dataUrl);
+        return dataUrl;
+    } catch {
+        appIconCache.set(appPath, null);
+        return null;
+    }
 });
 
 ipcMain.handle('ssh:list-hosts', async () => {
@@ -528,6 +648,102 @@ ipcMain.handle('app:hide-popup', async () => {
         popupWindow.hide();
     }
     return true;
+});
+
+ipcMain.handle('settings:get', async () => {
+    return await loadSettings();
+});
+
+ipcMain.handle('settings:update', async (event, patch) => {
+    const next = await updateSettings(patch);
+    if (patch?.hotkey) applyHotkey(next);
+    broadcast('settings:changed', next);
+    return next;
+});
+
+ipcMain.handle('hotkey:status', () => ({
+    registered: Boolean(registeredHotkey),
+    combo: registeredHotkey,
+    error: hotkeyError
+}));
+
+ipcMain.handle('db:get-stats', async () => {
+    return await getDbStats();
+});
+
+ipcMain.handle('db:clear-tables', async (event, groups) => {
+    return await clearTables(Array.isArray(groups) ? groups : []);
+});
+
+ipcMain.handle('files:local-home', async () => {
+    return localHome();
+});
+
+ipcMain.handle('files:local-list', async (event, dirPath) => {
+    return await listLocal(dirPath);
+});
+
+ipcMain.handle('files:remote-connect', async (event, host) => {
+    return await sftpManager.connect(host);
+});
+
+ipcMain.handle('files:remote-list', async (event, sessionId, dirPath) => {
+    return await sftpManager.list(sessionId, dirPath);
+});
+
+ipcMain.handle('files:remote-disconnect', async (event, sessionId) => {
+    return sftpManager.disconnect(sessionId);
+});
+
+ipcMain.handle('transfer:start', async (event, hostId, options) => {
+    const all = await listAllSshHosts();
+    const host = [...all.visible, ...all.hidden].find((h) => h.id === hostId);
+    if (!host) throw new Error(`Host ${hostId} not found`);
+    return await rsyncManager.start(host, options);
+});
+
+ipcMain.handle('transfer:cancel', async (event, transferId) => {
+    return rsyncManager.cancel(transferId);
+});
+
+ipcMain.handle('transfer:list', async () => {
+    return rsyncManager.list();
+});
+
+ipcMain.handle('transfer:sshpass-available', async () => {
+    return rsyncManager.isSshpassAvailable();
+});
+
+ipcMain.handle('rdp:list', async () => {
+    return listRdpHosts();
+});
+
+ipcMain.handle('rdp:create', async (event, input) => {
+    return await createRdpHost(input);
+});
+
+ipcMain.handle('rdp:update', async (event, id, input) => {
+    return await updateRdpHost(id, input);
+});
+
+ipcMain.handle('rdp:delete', async (event, id) => {
+    return await deleteRdpHost(id);
+});
+
+ipcMain.handle('rdp:connect', async (event, hostId) => {
+    return await rdpManager.connect(hostId);
+});
+
+ipcMain.handle('rdp:disconnect', async (event, sessionId) => {
+    return rdpManager.disconnect(sessionId);
+});
+
+ipcMain.handle('rdp:list-active', async () => {
+    return rdpManager.list();
+});
+
+ipcMain.handle('rdp:available', async () => {
+    return { available: rdpManager.isAvailable(), binary: rdpManager.getBinary() };
 });
 
 ipcMain.handle('docker:status', async () => {
@@ -646,12 +862,13 @@ process.on('unhandledRejection', (err) => logFatal('unhandledRejection', err));
 app.whenReady().then(async () => {
     try {
         await initDb();
+        const settings = await loadSettings();
         // Drop track entries older than retention window — stats live in
         // dedicated tables so this only trims the recent-list.
         await purgeOldHistory();
         await createMainWindow();
-        await createPopupWindow();
         createTray();
+        applyHotkey(settings);
         initBluetoothManager();
         mediaTracker.start();
     } catch (err) {
@@ -677,11 +894,16 @@ app.on('window-all-closed', () => {
 });
 
 app.on('will-quit', async () => {
+    globalShortcut.unregisterAll();
     if (bluetoothManager) {
         bluetoothManager.stopMonitoring();
     }
     sshManager.dispose();
     dockerManager.dispose();
+    sftpManager.dispose();
+    rsyncManager.dispose();
+    rdpManager.dispose();
+    diskScanner.cancel();
     await mediaTracker.stop();
     await closeDb();
 });

@@ -47,12 +47,90 @@ contextBridge.exposeInMainWorld('mediaAPI', {
 });
 
 contextBridge.exposeInMainWorld('systemAPI', {
-    getMetrics: () => ipcRenderer.invoke('system:get-metrics')
+    getMetrics: () => ipcRenderer.invoke('system:get-metrics'),
+    listProcesses: () => ipcRenderer.invoke('system:list-processes'),
+    killProcess: (pid, signal) => ipcRenderer.invoke('system:kill-process', pid, signal),
+    getAppIcon: (appPath) => ipcRenderer.invoke('system:get-app-icon', appPath)
+});
+
+contextBridge.exposeInMainWorld('diskAPI', {
+    scan: (rootPath, depth) => ipcRenderer.invoke('disk:scan', rootPath, depth),
+    cancel: () => ipcRenderer.invoke('disk:cancel-scan'),
+    onProgress: (callback) => {
+        const listener = (_, payload) => callback(payload);
+        ipcRenderer.on('disk:scan-progress', listener);
+        return () => ipcRenderer.removeListener('disk:scan-progress', listener);
+    }
 });
 
 contextBridge.exposeInMainWorld('appAPI', {
     showMain: () => ipcRenderer.invoke('app:show-main'),
     hidePopup: () => ipcRenderer.invoke('app:hide-popup')
+});
+
+contextBridge.exposeInMainWorld('settingsAPI', {
+    get: () => ipcRenderer.invoke('settings:get'),
+    update: (patch) => ipcRenderer.invoke('settings:update', patch),
+    onChanged: (callback) => {
+        const listener = (_, settings) => callback(settings);
+        ipcRenderer.on('settings:changed', listener);
+        return () => ipcRenderer.removeListener('settings:changed', listener);
+    }
+});
+
+contextBridge.exposeInMainWorld('hotkeyAPI', {
+    status: () => ipcRenderer.invoke('hotkey:status')
+});
+
+contextBridge.exposeInMainWorld('dbAPI', {
+    getStats: () => ipcRenderer.invoke('db:get-stats'),
+    clearTables: (groups) => ipcRenderer.invoke('db:clear-tables', groups)
+});
+
+contextBridge.exposeInMainWorld('filesAPI', {
+    localHome: () => ipcRenderer.invoke('files:local-home'),
+    listLocal: (dirPath) => ipcRenderer.invoke('files:local-list', dirPath),
+    remoteConnect: (host) => ipcRenderer.invoke('files:remote-connect', host),
+    listRemote: (sessionId, dirPath) => ipcRenderer.invoke('files:remote-list', sessionId, dirPath),
+    remoteDisconnect: (sessionId) => ipcRenderer.invoke('files:remote-disconnect', sessionId)
+});
+
+contextBridge.exposeInMainWorld('rdpAPI', {
+    list: () => ipcRenderer.invoke('rdp:list'),
+    create: (input) => ipcRenderer.invoke('rdp:create', input),
+    update: (id, input) => ipcRenderer.invoke('rdp:update', id, input),
+    remove: (id) => ipcRenderer.invoke('rdp:delete', id),
+    connect: (hostId) => ipcRenderer.invoke('rdp:connect', hostId),
+    disconnect: (sessionId) => ipcRenderer.invoke('rdp:disconnect', sessionId),
+    listActive: () => ipcRenderer.invoke('rdp:list-active'),
+    available: () => ipcRenderer.invoke('rdp:available'),
+    onActiveChanged: (callback) => {
+        const listener = (_, payload) => callback(payload);
+        ipcRenderer.on('rdp:active-changed', listener);
+        return () => ipcRenderer.removeListener('rdp:active-changed', listener);
+    },
+    onSessionExit: (callback) => {
+        const listener = (_, payload) => callback(payload);
+        ipcRenderer.on('rdp:session-exit', listener);
+        return () => ipcRenderer.removeListener('rdp:session-exit', listener);
+    }
+});
+
+contextBridge.exposeInMainWorld('transferAPI', {
+    start: (hostId, options) => ipcRenderer.invoke('transfer:start', hostId, options),
+    cancel: (transferId) => ipcRenderer.invoke('transfer:cancel', transferId),
+    list: () => ipcRenderer.invoke('transfer:list'),
+    sshpassAvailable: () => ipcRenderer.invoke('transfer:sshpass-available'),
+    onProgress: (callback) => {
+        const listener = (_, payload) => callback(payload);
+        ipcRenderer.on('transfer:progress', listener);
+        return () => ipcRenderer.removeListener('transfer:progress', listener);
+    },
+    onDone: (callback) => {
+        const listener = (_, payload) => callback(payload);
+        ipcRenderer.on('transfer:done', listener);
+        return () => ipcRenderer.removeListener('transfer:done', listener);
+    }
 });
 
 contextBridge.exposeInMainWorld('dockerAPI', {

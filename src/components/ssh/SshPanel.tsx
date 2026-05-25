@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react';
 import { ChevronDown, ChevronRight, EyeOff, Plus, RefreshCw, Search, Terminal as TerminalIcon } from 'lucide-react';
+import { FileBrowser } from './files/FileBrowser';
 import { HostOverrideForm } from './HostOverrideForm';
 import { HostRow } from './HostRow';
 import { SavedHostForm } from './SavedHostForm';
@@ -24,6 +25,7 @@ export function SshPanel({ sshSessions }: SshPanelProps) {
     const [query, setQuery] = useState('');
     const [showHidden, setShowHidden] = useState(false);
     const [formState, setFormState] = useState<FormState>({ kind: 'closed' });
+    const [browsingHost, setBrowsingHost] = useState<SshHost | null>(null);
 
     const matches = (host: SshHost, q: string) =>
         [host.alias, host.originalAlias, host.hostname, host.user]
@@ -100,6 +102,10 @@ export function SshPanel({ sshSessions }: SshPanelProps) {
         );
     }
 
+    if (browsingHost) {
+        return <FileBrowser host={browsingHost} onBack={() => setBrowsingHost(null)} />;
+    }
+
     return (
         <>
             <div className="mb-4 flex items-center justify-between gap-3">
@@ -168,6 +174,7 @@ export function SshPanel({ sshSessions }: SshPanelProps) {
                             host={host}
                             onConnect={handleConnect}
                             onEdit={handleEdit}
+                            onBrowseFiles={setBrowsingHost}
                             showOriginal
                         />
                     ))}

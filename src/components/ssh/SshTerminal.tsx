@@ -26,7 +26,9 @@ export function SshTerminal({ sessionId, isActive }: SshTerminalProps) {
             fontSize: 13,
             cursorBlink: true,
             convertEol: true,
-            scrollback: 5000
+            // 5k lines was eating ~3-5 MB per session in long-running shells.
+            // 1500 is enough for typical debug scrolling and trims ~70%.
+            scrollback: 1500
         });
         const fit = new FitAddon();
         term.loadAddon(fit);

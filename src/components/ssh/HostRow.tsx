@@ -1,9 +1,10 @@
-import { ArrowLeftRight, Edit3, FileKey, Lock, Server, Terminal as TerminalIcon } from 'lucide-react';
+import { ArrowLeftRight, Edit3, FileKey, FolderTree, Lock, Server, Terminal as TerminalIcon } from 'lucide-react';
 
 interface HostRowProps {
     host: SshHost;
     onConnect: (host: SshHost) => void;
     onEdit?: (host: SshHost) => void;
+    onBrowseFiles?: (host: SshHost) => void;
     showOriginal?: boolean;
 }
 
@@ -22,7 +23,7 @@ const SOURCE_LABELS: Record<SshHostSource, { text: string; className: string }> 
     saved: { text: 'saved', className: 'bg-indigo-100 text-indigo-700 dark:bg-indigo-950 dark:text-indigo-300' }
 };
 
-export function HostRow({ host, onConnect, onEdit, showOriginal }: HostRowProps) {
+export function HostRow({ host, onConnect, onEdit, onBrowseFiles, showOriginal }: HostRowProps) {
     const target = host.user ? `${host.user}@${host.hostname}` : host.hostname;
     const portLabel = host.port && host.port !== 22 ? `:${host.port}` : '';
     const sourceMeta = SOURCE_LABELS[host.source];
@@ -88,6 +89,16 @@ export function HostRow({ host, onConnect, onEdit, showOriginal }: HostRowProps)
                         title="Edit host"
                     >
                         <Edit3 className="h-4 w-4" aria-hidden="true" />
+                    </button>
+                )}
+                {onBrowseFiles && (
+                    <button
+                        type="button"
+                        className="flex h-9 w-9 items-center justify-center rounded-md text-zinc-500 opacity-0 transition hover:bg-zinc-100 hover:text-zinc-900 group-hover:opacity-100 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
+                        onClick={() => onBrowseFiles(host)}
+                        title="Browse files (rsync)"
+                    >
+                        <FolderTree className="h-4 w-4" aria-hidden="true" />
                     </button>
                 )}
                 <button

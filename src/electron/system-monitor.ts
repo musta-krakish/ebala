@@ -1,12 +1,10 @@
 import { execFile } from 'child_process';
+import { existsSync } from 'fs';
 import os from 'os';
 import { promisify } from 'util';
 
 const execFileAsync = promisify(execFile);
-
-// Force POSIX locale so ps/df/netstat emit numbers with `.` decimal separator
-// and stable column ordering regardless of the user's system locale.
-const POSIX_ENV = { ...process.env, LC_ALL: 'C', LANG: 'C' };
+const POSIX_ENV = { ...process.env, LC_NUMERIC: 'C', LC_CTYPE: 'en_US.UTF-8' };
 
 interface CpuSnapshot {
     idle: number;
@@ -22,11 +20,41 @@ interface NetworkSnapshot {
 interface ProcessInfo {
     pid: number;
     ppid: number;
+    user: string;
     cpuPercent: number;
     memoryBytes: number;
     name: string;
     command: string;
     role: string;
+}
+
+export interface ListedProcess {
+    pid: number;
+    ppid: number;
+    user: string;
+    isOwnUser: boolean;
+    cpuPercent: number;
+    memoryBytes: number;
+    name: string;
+    command: string;
+    appPath: string | null;
+    appName: string | null;
+}
+
+function extractAppPath(command: string): string | null {
+    const match = command.match(/^(.*?\.app)\//);
+    return match ? match[1] : null;
+}
+
+function appNameFromPath(appPath: string): string {
+    const tail = appPath.split('/').filter(Boolean).pop() ?? appPath;
+    return tail.replace(/\.app$/, '');
+}
+
+export interface KillResult {
+    success: boolean;
+    error?: string;
+    code?: string;
 }
 
 export interface SystemMetrics {
@@ -92,12 +120,6 @@ const getCpuSnapshot = (): CpuSnapshot => {
 export class SystemMonitor {
     private previousCpu = getCpuSnapshot();
     private previousNetwork: NetworkSnapshot | null = null;
-    // In a packaged .app, `process.cwd()` is `/` so the original heuristic
-    // (process.cwd + appSupportPath) matches nothing useful and the DFS
-    // through child processes also drags in unrelated Electron-based apps
-    // running on the system. Anchor on the .app bundle path instead — every
-    // child process spawned by this exact app has the bundle dir in its
-    // command line, and no other app does.
     private projectRoot = (() => {
         const exe = process.execPath;
         const appMatch = exe.match(/^(.*?\.app)\//);
@@ -154,17 +176,17 @@ export class SystemMonitor {
     }
 
     private async getDiskMetrics() {
+        const target = existsSync('/System/Volumes/Data') ? '/System/Volumes/Data' : '/';
         try {
-            const { stdout } = await execFileAsync('df', ['-k', '/'], { env: POSIX_ENV });
+            const { stdout } = await execFileAsync('df', ['-k', target], { env: POSIX_ENV });
             const line = stdout.trim().split('\n')[1];
             const parts = line?.trim().split(/\s+/) ?? [];
             const totalBytes = toNumber(parts[1]) * 1024;
             const usedBytes = toNumber(parts[2]) * 1024;
             const freeBytes = toNumber(parts[3]) * 1024;
-            const mount = parts[8] ?? '/';
 
             return {
-                mount,
+                mount: '/',
                 totalBytes,
                 usedBytes,
                 freeBytes,
@@ -318,9 +340,6 @@ export class SystemMonitor {
             `${root}/node_modules/.bin/vite`
         ];
 
-        // Packaged mode: every helper process has the .app bundle path in
-        // its executable path. Match exactly that to avoid pulling in other
-        // Electron apps on the system.
         const isPackaged = root.endsWith('.app');
 
         return (
@@ -345,27 +364,28 @@ export class SystemMonitor {
 
     private async getProcessList(): Promise<ProcessInfo[]> {
         try {
-            const { stdout } = await execFileAsync('ps', ['-axo', 'pid,ppid,%cpu,rss,comm,args'], { env: POSIX_ENV });
+            const { stdout } = await execFileAsync('ps', ['-axo', 'pid,ppid,user,%cpu,rss,comm,args'], { env: POSIX_ENV });
             const lines = stdout.trim().split('\n');
 
             const parsed = lines
                 .slice(1)
                 .map((line) => {
-                    const match = line.match(/^\s*(\d+)\s+(\d+)\s+([\d.]+)\s+(\d+)\s+(\S+)\s+(.*)$/);
+                    const match = line.match(/^\s*(\d+)\s+(\d+)\s+(\S+)\s+([\d.]+)\s+(\d+)\s+(\S+)\s+(.*)$/);
 
                     if (!match) {
                         return null;
                     }
 
-                    const commandPath = match[5] ?? '';
-                    const command = match[6] ?? commandPath;
+                    const commandPath = match[6] ?? '';
+                    const command = match[7] ?? commandPath;
                     const name = commandPath.split('/').filter(Boolean).pop() ?? command.split(/\s+/)[0] ?? 'process';
 
                     return {
                         pid: toNumber(match[1]),
                         ppid: toNumber(match[2]),
-                        cpuPercent: toNumber(match[3]),
-                        memoryBytes: toNumber(match[4]) * 1024,
+                        user: match[3] ?? '',
+                        cpuPercent: toNumber(match[4]),
+                        memoryBytes: toNumber(match[5]) * 1024,
                         name,
                         command,
                         role: this.getProcessRole(name, command)
@@ -377,6 +397,44 @@ export class SystemMonitor {
         } catch (error) {
             console.error('[SystemMonitor] ps failed:', error);
             return [];
+        }
+    }
+
+    async listAllProcesses(): Promise<ListedProcess[]> {
+        const processes = await this.getProcessList();
+        const currentUser = os.userInfo().username;
+
+        return processes.map((item) => {
+            const appPath = extractAppPath(item.command);
+            return {
+                pid: item.pid,
+                ppid: item.ppid,
+                user: item.user,
+                isOwnUser: item.user === currentUser,
+                cpuPercent: item.cpuPercent,
+                memoryBytes: item.memoryBytes,
+                name: item.name,
+                command: item.command,
+                appPath,
+                appName: appPath ? appNameFromPath(appPath) : null
+            };
+        });
+    }
+
+    killProcess(pid: number, signal: NodeJS.Signals | number = 'SIGTERM'): KillResult {
+        if (!Number.isInteger(pid) || pid <= 1) {
+            return { success: false, error: 'Invalid PID', code: 'EINVAL' };
+        }
+
+        try {
+            process.kill(pid, signal);
+            return { success: true };
+        } catch (error: any) {
+            return {
+                success: false,
+                error: error?.message ?? String(error),
+                code: error?.code
+            };
         }
     }
 

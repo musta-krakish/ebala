@@ -7,6 +7,7 @@ import { Client as Ssh2Client, type ClientChannel } from 'ssh2';
 import type { SshHost } from './ssh-config-parser.ts';
 import { getSavedHost, getSavedHostPassword } from './saved-hosts.ts';
 import { getOverridePassword } from './host-overrides.ts';
+import { resolveHost, tcpPreflight } from './host-resolver.ts';
 import { listPortForwards, type PortForward } from './port-forwards.ts';
 
 interface PtySession {
@@ -14,7 +15,6 @@ interface PtySession {
     host: SshHost;
     kind: 'pty';
     pty: IPty;
-    // pty path: tunnels are passed as ssh CLI args; nothing to clean up here.
 }
 
 interface Ssh2Session {
@@ -25,6 +25,7 @@ interface Ssh2Session {
     stream: ClientChannel | null;
     forwardServers: net.Server[];
     remoteForwards: Array<{ address: string; port: number }>;
+    pendingPrefix: string;
 }
 
 type Session = PtySession | Ssh2Session;
@@ -56,6 +57,23 @@ const buildSshCliArgs = (host: SshHost): string[] => {
 
 export class SshManager extends EventEmitter {
     private sessions = new Map<string, Session>();
+
+    private emitData(sessionId: string, data: string) {
+        const session = this.sessions.get(sessionId);
+        if (session?.kind === 'ssh2' && session.pendingPrefix) {
+            this.emit('data', { sessionId, data: session.pendingPrefix + data });
+            session.pendingPrefix = '';
+            return;
+        }
+        this.emit('data', { sessionId, data });
+    }
+
+    private appendPending(session: Ssh2Session, data: string) {
+        session.pendingPrefix += data;
+        if (session.pendingPrefix.length > 4096) {
+            session.pendingPrefix = session.pendingPrefix.slice(-4096);
+        }
+    }
 
     list(): Array<{ sessionId: string; host: SshHost }> {
         return Array.from(this.sessions.values()).map((session) => ({
@@ -167,6 +185,7 @@ export class SshManager extends EventEmitter {
         const { host, cols, rows, target } = args;
         const id = randomUUID();
         const client = new Ssh2Client();
+        const resolvePromise = resolveHost(target.hostname);
         const session: Ssh2Session = {
             id,
             host,
@@ -174,7 +193,8 @@ export class SshManager extends EventEmitter {
             client,
             stream: null,
             forwardServers: [],
-            remoteForwards: []
+            remoteForwards: [],
+            pendingPrefix: ''
         };
         this.sessions.set(id, session);
 
@@ -185,7 +205,11 @@ export class SshManager extends EventEmitter {
         };
 
         client.on('error', (err) => {
-            this.emit('data', { sessionId: id, data: `\r\n\x1b[31mError: ${err.message}\x1b[0m\r\n` });
+            const hint =
+                /handshake/i.test(err.message)
+                    ? ' (TCP works but the SSH service did not respond. Wrong port, sshd down, or a Tailscale ACL blocking port?)'
+                    : '';
+            this.emitData(id, `\r\n\x1b[31mError: ${err.message}${hint}\x1b[0m\r\n`);
             fail(err);
         });
 
@@ -223,10 +247,10 @@ export class SshManager extends EventEmitter {
         });
 
         client.on('ready', () => {
-            this.emit('data', {
-                sessionId: id,
-                data: `\x1b[32mConnected to ${target.username}@${target.hostname}:${target.port}\x1b[0m\r\n`
-            });
+            this.emitData(
+                id,
+                `\x1b[32mConnected to ${target.username}@${target.hostname}:${target.port}\x1b[0m\r\n`
+            );
 
             this.setupSsh2Tunnels(session);
 
@@ -256,18 +280,50 @@ export class SshManager extends EventEmitter {
             });
         });
 
-        try {
-            client.connect({
-                host: target.hostname,
-                port: target.port,
-                username: target.username,
-                password: target.password,
-                readyTimeout: 15000,
-                keepaliveInterval: 30000
-            });
-        } catch (err) {
-            fail(err as Error);
-        }
+        resolvePromise
+            .then(async ({ address, via }) => {
+                if (via === 'unresolved') {
+                    this.emitData(
+                        id,
+                        `\r\n\x1b[31mCould not resolve ${target.hostname}. For Tailscale: try the 100.x.x.x IP or full \`.ts.net\` name.\x1b[0m\r\n`
+                    );
+                    fail(new Error(`Could not resolve ${target.hostname}`));
+                    return;
+                }
+                if (via !== 'literal') {
+                    this.appendPending(
+                        session,
+                        `\x1b[36mResolved ${target.hostname} → ${address} (${via})\x1b[0m\r\n`
+                    );
+                }
+
+                try {
+                    await tcpPreflight(address, target.port, 8000);
+                } catch (err) {
+                    const message = err instanceof Error ? err.message : String(err);
+                    this.emitData(
+                        id,
+                        `\r\n\x1b[31m${message}. Tailscale tunnel up? Try \`tailscale status\` / \`tailscale ping ${target.hostname}\`.\x1b[0m\r\n`
+                    );
+                    fail(err instanceof Error ? err : new Error(message));
+                    return;
+                }
+                this.appendPending(session, `\x1b[36mTCP ok ${address}:${target.port}, waiting for SSH banner…\x1b[0m\r\n`);
+
+                try {
+                    client.connect({
+                        host: address,
+                        port: target.port,
+                        username: target.username,
+                        password: target.password,
+                        readyTimeout: 30000,
+                        keepaliveInterval: 30000
+                    });
+                } catch (err) {
+                    fail(err as Error);
+                }
+            })
+            .catch((err: Error) => fail(err));
 
         return { sessionId: id };
     }

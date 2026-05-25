@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
+import { useVisibility } from '../../lib/useVisibility';
 
 const POLL_INTERVAL_MS = 5000;
 
@@ -11,6 +12,7 @@ interface UseDockerStatusReturn {
 export function useDockerStatus(): UseDockerStatusReturn {
     const [status, setStatus] = useState<DockerStatus | null>(null);
     const [loading, setLoading] = useState(true);
+    const visible = useVisibility();
 
     const refresh = useCallback(async () => {
         if (typeof window === 'undefined' || !window.dockerAPI) return;
@@ -25,10 +27,11 @@ export function useDockerStatus(): UseDockerStatusReturn {
     }, []);
 
     useEffect(() => {
+        if (!visible) return;
         refresh();
         const interval = window.setInterval(refresh, 15_000);
         return () => window.clearInterval(interval);
-    }, [refresh]);
+    }, [refresh, visible]);
 
     return { status, loading, refresh };
 }
@@ -41,6 +44,7 @@ export function useDockerList<T>(
     const [items, setItems] = useState<T[]>([]);
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
+    const visible = useVisibility();
 
     const refresh = useCallback(async () => {
         if (!enabled) return;
@@ -58,11 +62,11 @@ export function useDockerList<T>(
     }, [enabled, ...deps]);
 
     useEffect(() => {
-        if (!enabled) return;
+        if (!enabled || !visible) return;
         refresh();
         const interval = window.setInterval(refresh, POLL_INTERVAL_MS);
         return () => window.clearInterval(interval);
-    }, [enabled, refresh]);
+    }, [enabled, refresh, visible]);
 
     return { items, loading, error, refresh };
 }
