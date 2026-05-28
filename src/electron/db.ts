@@ -10,7 +10,6 @@ import initSqlJs, { type Database } from 'sql.js';
 // the renderer never has to know about table names.
 export const DB_TABLE_GROUPS = {
     sshHosts: ['saved_hosts', 'host_overrides', 'port_forwards'],
-    rdpHosts: ['rdp_hosts'],
     mediaHistory: ['media_history'],
     mediaStats: ['media_artist_stats', 'media_track_stats']
 } as const;
@@ -139,28 +138,12 @@ const runMigrations = (database: Database) => {
         );
         CREATE INDEX IF NOT EXISTS idx_media_track_stats_artist ON media_track_stats (artist, total_seconds DESC);
         CREATE INDEX IF NOT EXISTS idx_media_track_stats_total ON media_track_stats (total_seconds DESC);
-
-        CREATE TABLE IF NOT EXISTS rdp_hosts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            label TEXT NOT NULL,
-            hostname TEXT NOT NULL,
-            port INTEGER NOT NULL DEFAULT 3389,
-            username TEXT NOT NULL,
-            password_encrypted BLOB,
-            domain TEXT,
-            color TEXT,
-            notes TEXT,
-            created_at INTEGER NOT NULL,
-            updated_at INTEGER NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_rdp_hosts_label ON rdp_hosts (label);
     `);
 
     // Forward-compatible migrations for databases created by older versions.
     addColumnIfMissing(database, 'host_overrides', 'username', 'TEXT');
     addColumnIfMissing(database, 'host_overrides', 'password_encrypted', 'BLOB');
     addColumnIfMissing(database, 'host_overrides', 'auth_method', 'TEXT');
-    addColumnIfMissing(database, 'rdp_hosts', 'extra_args', 'TEXT');
 
     // One-time backfill: if the aggregate tables are empty but we have an
     // existing media_history, roll it up so the "By artist" view isn't blank

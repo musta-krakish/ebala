@@ -1,21 +1,30 @@
+import { useCallback, useState } from 'react';
 import { Music2, RefreshCw } from 'lucide-react';
 import { MediaCard } from './MediaCard';
 import { MediaHistoryList } from './MediaHistoryList';
 import { MediaStats } from './MediaStats';
+import { useMedia } from './useMedia';
 import { useMediaHistory } from './useMediaHistory';
 
-interface MediaPanelProps {
-    tracks: MediaTrack[];
-    loading: boolean;
-    onRefresh: () => void;
-    onControl: (action: MediaAction, bundleId?: string | null) => void;
-}
+const ERROR_VISIBLE_MS = 5000;
 
-export function MediaPanel({ tracks, loading, onRefresh, onControl }: MediaPanelProps) {
+export default function MediaPanel() {
+    const [error, setError] = useState<string | null>(null);
+    const showError = useCallback((message: string) => {
+        setError(message);
+        window.setTimeout(() => setError(null), ERROR_VISIBLE_MS);
+    }, []);
+
+    const { tracks, loading, refresh: onRefresh, control: onControl } = useMedia(showError);
     const { history, artists, stats, clearRecent, clearAll } = useMediaHistory();
 
     return (
         <section className="flex flex-col gap-5">
+            {error && (
+                <div className="rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-800 dark:border-rose-900 dark:bg-rose-950 dark:text-rose-200">
+                    {error}
+                </div>
+            )}
             <div className="flex items-center justify-between gap-3">
                 <div>
                     <h2 className="text-base font-semibold text-zinc-950 dark:text-zinc-50">Now Playing</h2>

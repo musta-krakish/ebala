@@ -1,0 +1,12 @@
+{
+  "id": "hello-world",
+  "name": "Hello World",
+  "description": "Minimal example plugin: a main-process IPC handler and a renderer panel.",
+  "version": "0.1.0",
+  "icon": "Star",
+  "capabilities": {
+    "main": "dist/main.cjs",
+    "renderer": "dist/renderer.js",
+    "badge": false
+  }
+}

@@ -1,28 +1,24 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
-import { Activity, Bluetooth, ChevronUp, Container, Cpu, HardDrive, Loader2, Monitor, Music2, RefreshCw, Settings as SettingsIcon, Terminal, X } from 'lucide-react';
-import { BluetoothPanel } from './bluetooth/BluetoothPanel';
-import { useBluetooth } from './bluetooth/useBluetooth';
-import { DockerPanel } from './docker/DockerPanel';
-import { MediaPanel } from './media/MediaPanel';
-import { useMedia } from './media/useMedia';
+import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Activity, ChevronUp, Cpu, HardDrive, Settings as SettingsIcon, Terminal, X } from 'lucide-react';
 import { SshPanel } from './ssh/SshPanel';
 import { SshTerminalDrawer } from './ssh/SshTerminalDrawer';
 import { useSshSessions } from './ssh/useSshSessions';
 import { DiskUsagePanel } from './disk/DiskUsagePanel';
-import { RdpPanel } from './rdp/RdpPanel';
 import { SettingsPanel } from './settings/SettingsPanel';
 import { ProcessDrawer } from './system/ProcessDrawer';
 import { SystemMonitorPanel } from './system/SystemMonitorPanel';
 import { useSystemMetrics } from './system/useSystemMetrics';
 import { TabNav, type TabItem } from './tabs/TabNav';
 import { ThemeToggle } from './theme/ThemeToggle';
-
-type TabId = 'ssh' | 'rdp' | 'docker' | 'bluetooth' | 'system' | 'disk' | 'media' | 'settings';
+import { rendererPlugins } from '../features/renderer-plugins';
+import { useExternalPlugins, useExternalPluginLoader } from '../plugin/runtime';
+import { ExecProvider } from '../lib/exec-context';
+import { useAppSettings } from './useAppSettings';
 
 const ERROR_VISIBLE_MS = 5000;
 
 export function ControlCenter() {
-    const [activeTab, setActiveTab] = useState<TabId>('ssh');
+    const [selectedTab, setActiveTab] = useState<string>('ssh');
     const [error, setError] = useState<string | null>(null);
 
     const showError = useCallback((message: string) => {
@@ -30,8 +26,12 @@ export function ControlCenter() {
         window.setTimeout(() => setError(null), ERROR_VISIBLE_MS);
     }, []);
 
-    const bluetooth = useBluetooth(showError);
-    const media = useMedia(showError);
+    const { settings } = useAppSettings();
+    const disabledPlugins = settings.plugins.disabled;
+
+    useExternalPluginLoader();
+    const externalPlugins = useExternalPlugins();
+
     const system = useSystemMetrics();
 
     const sshSessions = useSshSessions();
@@ -58,18 +58,44 @@ export function ControlCenter() {
         [sshSessions, showError]
     );
 
-    const tabs: TabItem[] = [
-        { id: 'ssh', label: 'SSH', icon: Terminal },
-        { id: 'rdp', label: 'RDP', icon: Monitor },
-        { id: 'docker', label: 'Docker', icon: Container },
-        { id: 'bluetooth', label: 'Bluetooth', icon: Bluetooth, badge: bluetooth.connectedDevices.length || undefined },
-        { id: 'system', label: 'System', icon: Activity },
-        { id: 'disk', label: 'Disk Utils', icon: HardDrive },
-        { id: 'media', label: 'Media', icon: Music2 },
-        { id: 'settings', label: 'Settings', icon: SettingsIcon }
-    ];
+    // Exposed to feature panels (Docker) so their "Exec" opens a session in the
+    // shared SSH terminal drawer.
+    const execValue = useMemo(() => ({ openExec: handleDockerExec }), [handleDockerExec]);
+
+    // Built-in + installed external plugins; only enabled ones get a tab/panel.
+    // The badge is passed as a hook (TabNav calls it per-tab) so the dynamic
+    // plugin set stays hooks-safe.
+    const allPlugins = [...rendererPlugins, ...externalPlugins];
+    const enabledPlugins = allPlugins.filter((plugin) => !disabledPlugins.includes(plugin.id));
+    const pluginTabs: Record<string, TabItem> = {};
+    for (const plugin of enabledPlugins) {
+        pluginTabs[plugin.id] = { id: plugin.id, label: plugin.label, icon: plugin.icon, useBadge: plugin.useBadge };
+    }
+
+    const legacyTabs: Record<string, TabItem> = {
+        ssh: { id: 'ssh', label: 'SSH', icon: Terminal },
+        system: { id: 'system', label: 'System', icon: Activity },
+        disk: { id: 'disk', label: 'Disk Utils', icon: HardDrive },
+        settings: { id: 'settings', label: 'Settings', icon: SettingsIcon }
+    };
+
+    // Built-in order, external plugin tabs appended before Settings.
+    const externalTabIds = enabledPlugins
+        .filter((plugin) => !rendererPlugins.includes(plugin))
+        .map((plugin) => plugin.id);
+    const tabOrder = ['ssh', 'docker', 'bluetooth', 'system', 'disk', 'media', ...externalTabIds, 'settings'];
+    const tabs: TabItem[] = tabOrder.map((id) => pluginTabs[id] ?? legacyTabs[id]).filter(
+        (tab): tab is TabItem => Boolean(tab)
+    );
+
+    // Derive the active tab so a disabled/uninstalled plugin's tab (now absent)
+    // falls back to SSH without a state-syncing effect.
+    const activeTab = tabs.some((tab) => tab.id === selectedTab) ? selectedTab : 'ssh';
+
+    const activePlugin = enabledPlugins.find((plugin) => plugin.id === activeTab);
 
     return (
+        <ExecProvider value={execValue}>
         <main className="min-h-screen bg-zinc-100 text-zinc-950 dark:bg-zinc-950 dark:text-zinc-50">
             <header className="drag-region sticky top-0 z-50 border-b border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-900">
                 <div className="mx-auto flex w-full max-w-7xl items-center justify-between gap-4 px-4 py-3 sm:px-6 lg:px-8">
@@ -80,9 +106,7 @@ export function ControlCenter() {
                         <div>
                             <h1 className="text-base font-semibold tracking-tight text-zinc-950 dark:text-zinc-50">Control Center</h1>
                             <p className="text-xs text-zinc-500 dark:text-zinc-400">
-                                {activeTab === 'bluetooth' && bluetooth.lastUpdated
-                                    ? `Bluetooth updated ${bluetooth.lastUpdated.toLocaleTimeString()}`
-                                    : activeTab === 'system' && system.metrics
+                                {activeTab === 'system' && system.metrics
                                     ? `System updated ${new Date(system.metrics.timestamp).toLocaleTimeString()}`
                                     : 'SSH · Bluetooth · System · Media'}
                             </p>
@@ -133,27 +157,12 @@ export function ControlCenter() {
                                 </span>
                             </button>
                         )}
-                        {activeTab === 'bluetooth' && (
-                            <button
-                                type="button"
-                                className="inline-flex h-9 items-center justify-center gap-2 rounded-md bg-zinc-950 px-3 text-sm font-medium text-white transition hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-indigo-600 dark:hover:bg-indigo-500"
-                                onClick={bluetooth.scan}
-                                disabled={bluetooth.isScanning || !bluetooth.available}
-                            >
-                                {bluetooth.isScanning ? (
-                                    <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
-                                ) : (
-                                    <RefreshCw className="h-4 w-4" aria-hidden="true" />
-                                )}
-                                {bluetooth.isScanning ? 'Scanning' : 'Scan'}
-                            </button>
-                        )}
                         <ThemeToggle />
                     </div>
                 </div>
 
                 <div className="no-drag mx-auto w-full max-w-7xl px-4 sm:px-6 lg:px-8">
-                    <TabNav items={tabs} activeId={activeTab} onChange={(id) => setActiveTab(id as TabId)} />
+                    <TabNav items={tabs} activeId={activeTab} onChange={setActiveTab} />
                 </div>
             </header>
 
@@ -166,19 +175,14 @@ export function ControlCenter() {
 
                 {activeTab === 'ssh' && <SshPanel sshSessions={sshSessions} />}
 
-                {activeTab === 'rdp' && <RdpPanel />}
-
-                {activeTab === 'docker' && <DockerPanel onExec={handleDockerExec} />}
-
-                {activeTab === 'bluetooth' && (
-                    <BluetoothPanel
-                        connectedDevices={bluetooth.connectedDevices}
-                        availableDevices={bluetooth.availableDevices}
-                        busyAddress={bluetooth.busyAddress}
-                        onConnect={bluetooth.connect}
-                        onDisconnect={bluetooth.disconnect}
-                        onForget={bluetooth.forget}
-                    />
+                {activePlugin && (
+                    <Suspense
+                        fallback={
+                            <div className="py-10 text-center text-sm text-zinc-500 dark:text-zinc-400">Loading…</div>
+                        }
+                    >
+                        <activePlugin.Panel />
+                    </Suspense>
                 )}
 
                 {activeTab === 'system' && (
@@ -190,15 +194,6 @@ export function ControlCenter() {
                 )}
 
                 {activeTab === 'disk' && <DiskUsagePanel />}
-
-                {activeTab === 'media' && (
-                    <MediaPanel
-                        tracks={media.tracks}
-                        loading={media.loading}
-                        onRefresh={media.refresh}
-                        onControl={media.control}
-                    />
-                )}
 
                 {activeTab === 'settings' && <SettingsPanel />}
             </div>
@@ -232,5 +227,6 @@ export function ControlCenter() {
                 </button>
             )}
         </main>
+        </ExecProvider>
     );
 }

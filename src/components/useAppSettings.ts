@@ -12,6 +12,9 @@ const DEFAULTS: AppSettings = {
     hotkey: {
         enabled: true,
         combo: 'Cmd+Shift+M'
+    },
+    plugins: {
+        disabled: []
     }
 };
 

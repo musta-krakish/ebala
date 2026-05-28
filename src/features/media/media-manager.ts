@@ -2,9 +2,14 @@ import { execFile } from 'child_process';
 import { existsSync, mkdirSync, statSync } from 'fs';
 import path from 'path';
 import { promisify } from 'util';
-import { helperCacheDir, helperSourceDir } from './paths.ts';
+import { fileURLToPath } from 'url';
+import { helperCacheDir, helperSourceDir } from '../../electron/paths.ts';
 
 const execFilePromise = promisify(execFile);
+
+// Dev-time location of this feature's .swift sources (co-located here).
+// Ignored in packaged builds, which read from the flattened resources dir.
+const featureDir = path.dirname(fileURLToPath(import.meta.url));
 
 // Only track music from real music apps — never browsers (Chrome/Safari/etc.
 // would otherwise leak YouTube/SoundCloud/site audio into history). Add a
@@ -95,7 +100,7 @@ async function runAppleScript(script: string): Promise<string> {
 
 async function getSwiftHelper(scriptName: string): Promise<string> {
     const cacheDir = helperCacheDir();
-    const sourcePath = path.join(helperSourceDir(), scriptName);
+    const sourcePath = path.join(helperSourceDir(featureDir), scriptName);
     const outputPath = path.join(cacheDir, scriptName.replace(/\.swift$/, ''));
     const needsBuild =
         !existsSync(outputPath) ||
@@ -212,7 +217,7 @@ const APPLESCRIPT_CONTROLLERS: Record<string, (action: MediaAction) => Promise<v
 export class MediaManager {
     async getAllNowPlaying(): Promise<MediaTrack[]> {
         try {
-            const swiftPath = path.join(helperSourceDir(), 'now-playing.swift');
+            const swiftPath = path.join(helperSourceDir(featureDir), 'now-playing.swift');
             const { stdout } = await execFilePromise('swift', [swiftPath], { timeout: 7000 });
             const entries = JSON.parse(stdout.toString()) as Record<string, unknown>[];
             const tracks = entries

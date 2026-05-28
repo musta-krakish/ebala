@@ -19,8 +19,8 @@ import {
     Square,
     Terminal
 } from 'lucide-react';
-import { useBluetooth } from './bluetooth/useBluetooth';
-import { useMedia } from './media/useMedia';
+import { useBluetooth } from '../features/bluetooth/useBluetooth';
+import { useMedia } from '../features/media/useMedia';
 import { useSystemMetrics } from './system/useSystemMetrics';
 import { useAppSettings } from './useAppSettings';
 import { formatBytes, formatPercent, formatRate } from '../lib/format';

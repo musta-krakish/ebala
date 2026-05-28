@@ -82,6 +82,31 @@ contextBridge.exposeInMainWorld('hotkeyAPI', {
     status: () => ipcRenderer.invoke('hotkey:status')
 });
 
+contextBridge.exposeInMainWorld('pluginsAPI', {
+    setEnabled: (id, enabled) => ipcRenderer.invoke('plugins:set-enabled', id, enabled),
+    list: () => ipcRenderer.invoke('plugins:list'),
+    readRenderer: (id) => ipcRenderer.invoke('plugins:read-renderer', id),
+    install: (gitUrl) => ipcRenderer.invoke('plugins:install', gitUrl),
+    uninstall: (id) => ipcRenderer.invoke('plugins:uninstall', id),
+    onChanged: (callback) => {
+        const listener = () => callback();
+        ipcRenderer.on('plugins:changed', listener);
+        return () => ipcRenderer.removeListener('plugins:changed', listener);
+    }
+});
+
+// Generic IPC bridge for plugin code to reach its own main-process handlers.
+// Plugins run with full privileges by design (see Settings warning), so this
+// intentionally allows any channel.
+contextBridge.exposeInMainWorld('pluginBridge', {
+    invoke: (channel, ...args) => ipcRenderer.invoke(channel, ...args),
+    on: (channel, callback) => {
+        const listener = (_, payload) => callback(payload);
+        ipcRenderer.on(channel, listener);
+        return () => ipcRenderer.removeListener(channel, listener);
+    }
+});
+
 contextBridge.exposeInMainWorld('dbAPI', {
     getStats: () => ipcRenderer.invoke('db:get-stats'),
     clearTables: (groups) => ipcRenderer.invoke('db:clear-tables', groups)
@@ -93,27 +118,6 @@ contextBridge.exposeInMainWorld('filesAPI', {
     remoteConnect: (host) => ipcRenderer.invoke('files:remote-connect', host),
     listRemote: (sessionId, dirPath) => ipcRenderer.invoke('files:remote-list', sessionId, dirPath),
     remoteDisconnect: (sessionId) => ipcRenderer.invoke('files:remote-disconnect', sessionId)
-});
-
-contextBridge.exposeInMainWorld('rdpAPI', {
-    list: () => ipcRenderer.invoke('rdp:list'),
-    create: (input) => ipcRenderer.invoke('rdp:create', input),
-    update: (id, input) => ipcRenderer.invoke('rdp:update', id, input),
-    remove: (id) => ipcRenderer.invoke('rdp:delete', id),
-    connect: (hostId) => ipcRenderer.invoke('rdp:connect', hostId),
-    disconnect: (sessionId) => ipcRenderer.invoke('rdp:disconnect', sessionId),
-    listActive: () => ipcRenderer.invoke('rdp:list-active'),
-    available: () => ipcRenderer.invoke('rdp:available'),
-    onActiveChanged: (callback) => {
-        const listener = (_, payload) => callback(payload);
-        ipcRenderer.on('rdp:active-changed', listener);
-        return () => ipcRenderer.removeListener('rdp:active-changed', listener);
-    },
-    onSessionExit: (callback) => {
-        const listener = (_, payload) => callback(payload);
-        ipcRenderer.on('rdp:session-exit', listener);
-        return () => ipcRenderer.removeListener('rdp:session-exit', listener);
-    }
 });
 
 contextBridge.exposeInMainWorld('transferAPI', {

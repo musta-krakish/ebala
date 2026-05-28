@@ -19,8 +19,10 @@ import {
 import { formatBytes } from '../../lib/format';
 import { useAppSettings } from '../useAppSettings';
 import { HotkeyCapture } from './HotkeyCapture';
+import { SettingCard } from './SettingCard';
+import { PluginsCard } from './PluginsCard';
 
-type DbGroupKey = 'sshHosts' | 'rdpHosts' | 'mediaHistory' | 'mediaStats';
+type DbGroupKey = 'sshHosts' | 'mediaHistory' | 'mediaStats';
 
 interface DbGroupMeta {
     key: DbGroupKey;
@@ -33,11 +35,6 @@ const DB_GROUPS: DbGroupMeta[] = [
         key: 'sshHosts',
         title: 'SSH hosts & port forwards',
         description: 'Saved hosts, host overrides, port-forward rules.'
-    },
-    {
-        key: 'rdpHosts',
-        title: 'RDP hosts',
-        description: 'Saved Remote Desktop targets and encrypted passwords.'
     },
     {
         key: 'mediaHistory',
@@ -108,7 +105,7 @@ export function SettingsPanel() {
         setDbError(null);
         try {
             const groups: DbTableGroup[] = key === 'all'
-                ? ['sshHosts', 'rdpHosts', 'mediaHistory', 'mediaStats']
+                ? ['sshHosts', 'mediaHistory', 'mediaStats']
                 : [key];
             const next = await window.dbAPI.clearTables(groups);
             setDbStats(next);
@@ -149,6 +146,8 @@ export function SettingsPanel() {
                     />
                 </div>
             </SettingCard>
+
+            <PluginsCard disabled={settings.plugins.disabled} ready={ready} />
 
             <SettingCard
                 title="Global hotkey"
@@ -351,30 +350,6 @@ export function SettingsPanel() {
                 </ul>
             </SettingCard>
         </section>
-    );
-}
-
-interface SettingCardProps {
-    title: string;
-    description?: string;
-    action?: React.ReactNode;
-    children: React.ReactNode;
-}
-
-function SettingCard({ title, description, action, children }: SettingCardProps) {
-    return (
-        <div className="rounded-lg border border-zinc-200 bg-white p-4 shadow-sm dark:border-zinc-800 dark:bg-zinc-900">
-            <div className="mb-3 flex items-start justify-between gap-3">
-                <div>
-                    <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-50">{title}</h3>
-                    {description && (
-                        <p className="text-xs text-zinc-500 dark:text-zinc-400">{description}</p>
-                    )}
-                </div>
-                {action}
-            </div>
-            {children}
-        </div>
     );
 }
 

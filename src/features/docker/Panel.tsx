@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { AlertCircle, Box, Database, Image as ImageIcon, Loader2, Network, Trash2 } from 'lucide-react';
+import { useExec } from '../../lib/exec-context';
 import { useDockerStatus } from './useDocker';
 import { ContainersTab } from './ContainersTab';
 import { ImagesTab } from './ImagesTab';
@@ -9,10 +10,6 @@ import { summarizePruneOutput } from './prune-summary';
 
 type DockerSubTab = 'containers' | 'images' | 'volumes' | 'networks';
 
-interface DockerPanelProps {
-    onExec: (target: { id: string; name: string; image: string }) => void;
-}
-
 const SUB_TABS: Array<{ id: DockerSubTab; label: string; icon: React.ComponentType<{ className?: string }> }> = [
     { id: 'containers', label: 'Containers', icon: Box },
     { id: 'images', label: 'Images', icon: ImageIcon },
@@ -20,7 +17,8 @@ const SUB_TABS: Array<{ id: DockerSubTab; label: string; icon: React.ComponentTy
     { id: 'networks', label: 'Networks', icon: Network }
 ];
 
-export function DockerPanel({ onExec }: DockerPanelProps) {
+export default function DockerPanel() {
+    const exec = useExec();
     const { status, loading } = useDockerStatus();
     const [activeTab, setActiveTab] = useState<DockerSubTab>('containers');
     const [pruning, setPruning] = useState(false);
@@ -109,7 +107,7 @@ export function DockerPanel({ onExec }: DockerPanelProps) {
                 })}
             </div>
 
-            {activeTab === 'containers' && <ContainersTab enabled onExec={onExec} />}
+            {activeTab === 'containers' && <ContainersTab enabled onExec={(t) => exec?.openExec(t)} />}
             {activeTab === 'images' && <ImagesTab enabled />}
             {activeTab === 'volumes' && <VolumesTab enabled />}
             {activeTab === 'networks' && <NetworksTab enabled />}

@@ -63,15 +63,24 @@ async function main() {
         path.join(outDir, 'preload.cjs')
     );
 
-    // Swift sources go to a sibling `swift/` dir; electron-builder ships them
-    // to Contents/Resources/swift/ (mirrored by `helperSourceDir()` for prod).
+    // Swift sources are flattened into a sibling `swift/` dir; electron-builder
+    // ships them to Contents/Resources/swift/ (where helperSourceDir() reads
+    // them in packaged builds). Sources live next to their feature
+    // (src/features/<f>/) or in src/electron — collect from anywhere under src.
+    // Filenames must stay unique since they flatten into one dir.
     const swiftDir = path.join(outDir, 'swift');
     await mkdir(swiftDir, { recursive: true });
-    const electronDir = path.join(projectRoot, 'src', 'electron');
-    for (const file of await readdir(electronDir)) {
-        if (file.endsWith('.swift')) {
-            await copyFile(path.join(electronDir, file), path.join(swiftDir, file));
+    const collectSwift = async (dir) => {
+        const found = [];
+        for (const entry of await readdir(dir, { withFileTypes: true })) {
+            const full = path.join(dir, entry.name);
+            if (entry.isDirectory()) found.push(...(await collectSwift(full)));
+            else if (entry.name.endsWith('.swift')) found.push(full);
         }
+        return found;
+    };
+    for (const file of await collectSwift(path.join(projectRoot, 'src'))) {
+        await copyFile(file, path.join(swiftDir, path.basename(file)));
     }
 
     console.log(`✓ Bundled main → ${path.relative(projectRoot, outDir)}/main.cjs`);

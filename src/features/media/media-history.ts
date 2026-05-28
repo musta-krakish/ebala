@@ -1,5 +1,5 @@
 import type { BindParams } from 'sql.js';
-import { getDb, persist } from './db.ts';
+import { getDb, persist } from '../../electron/db.ts';
 
 export interface MediaHistoryEntry {
     id: number;

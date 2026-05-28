@@ -2777,8 +2777,8 @@ var require_dom = __commonJS({
         node,
         { ns: visibleNamespaces },
         {
-          enter: function(n, ctx) {
-            var namespaces = ctx.ns;
+          enter: function(n, ctx2) {
+            var namespaces = ctx2.ns;
             if (nodeFilter) {
               n = nodeFilter(n);
               if (n) {
@@ -10525,17 +10525,2323 @@ var require_lib2 = __commonJS({
 
 // main.js
 var import_electron5 = require("electron");
-var import_fs8 = require("fs");
+var import_fs10 = require("fs");
+var import_promises9 = require("fs/promises");
 var import_os8 = __toESM(require("os"), 1);
-var import_path12 = __toESM(require("path"), 1);
-var import_url2 = require("url");
+var import_path14 = __toESM(require("path"), 1);
+var import_url5 = require("url");
 
-// src/electron/bluetooth-manager.ts
+// src/electron/system-monitor.ts
 var import_child_process = require("child_process");
 var import_fs = require("fs");
-var import_path2 = __toESM(require("path"), 1);
+var import_os = __toESM(require("os"), 1);
 var import_util = require("util");
+var execFileAsync = (0, import_util.promisify)(import_child_process.execFile);
+var POSIX_ENV = { ...process.env, LC_NUMERIC: "C", LC_CTYPE: "en_US.UTF-8" };
+function extractAppPath(command) {
+  const match = command.match(/^(.*?\.app)\//);
+  return match ? match[1] : null;
+}
+function appNameFromPath(appPath) {
+  const tail = appPath.split("/").filter(Boolean).pop() ?? appPath;
+  return tail.replace(/\.app$/, "");
+}
+var toNumber = (value) => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+};
+var getCpuSnapshot = () => {
+  return import_os.default.cpus().reduce(
+    (snapshot, cpu) => {
+      const total = Object.values(cpu.times).reduce((sum, value) => sum + value, 0);
+      return {
+        idle: snapshot.idle + cpu.times.idle,
+        total: snapshot.total + total
+      };
+    },
+    { idle: 0, total: 0 }
+  );
+};
+var SystemMonitor = class {
+  previousCpu = getCpuSnapshot();
+  previousNetwork = null;
+  projectRoot = (() => {
+    const exe = process.execPath;
+    const appMatch = exe.match(/^(.*?\.app)\//);
+    if (appMatch) {
+      return appMatch[1];
+    }
+    return process.cwd();
+  })();
+  appName = this.projectRoot.split("/").filter(Boolean).pop()?.replace(/\.app$/, "") ?? "app";
+  async getMetrics() {
+    const [disk, network, project] = await Promise.all([
+      this.getDiskMetrics(),
+      this.getNetworkMetrics(),
+      this.getProjectMetrics()
+    ]);
+    return {
+      timestamp: Date.now(),
+      cpu: this.getCpuMetrics(),
+      memory: this.getMemoryMetrics(),
+      disk,
+      network,
+      project
+    };
+  }
+  getCpuMetrics() {
+    const current = getCpuSnapshot();
+    const idleDelta = current.idle - this.previousCpu.idle;
+    const totalDelta = current.total - this.previousCpu.total;
+    this.previousCpu = current;
+    const percent = totalDelta > 0 ? (totalDelta - idleDelta) / totalDelta * 100 : 0;
+    return {
+      percent: Math.min(Math.max(percent, 0), 100),
+      cores: import_os.default.cpus().length,
+      loadAverage: import_os.default.loadavg()
+    };
+  }
+  getMemoryMetrics() {
+    const totalBytes = import_os.default.totalmem();
+    const freeBytes = import_os.default.freemem();
+    const usedBytes = totalBytes - freeBytes;
+    return {
+      totalBytes,
+      usedBytes,
+      freeBytes,
+      percent: totalBytes > 0 ? usedBytes / totalBytes * 100 : 0
+    };
+  }
+  async getDiskMetrics() {
+    const target = (0, import_fs.existsSync)("/System/Volumes/Data") ? "/System/Volumes/Data" : "/";
+    try {
+      const { stdout } = await execFileAsync("df", ["-k", target], { env: POSIX_ENV });
+      const line = stdout.trim().split("\n")[1];
+      const parts = line?.trim().split(/\s+/) ?? [];
+      const totalBytes = toNumber(parts[1]) * 1024;
+      const usedBytes = toNumber(parts[2]) * 1024;
+      const freeBytes = toNumber(parts[3]) * 1024;
+      return {
+        mount: "/",
+        totalBytes,
+        usedBytes,
+        freeBytes,
+        percent: totalBytes > 0 ? usedBytes / totalBytes * 100 : 0
+      };
+    } catch (error) {
+      console.error("[SystemMonitor] df failed:", error);
+      return {
+        mount: "/",
+        totalBytes: 0,
+        usedBytes: 0,
+        freeBytes: 0,
+        percent: 0
+      };
+    }
+  }
+  async getNetworkMetrics() {
+    const current = await this.readNetworkTotals();
+    const previous = this.previousNetwork;
+    this.previousNetwork = current;
+    if (!previous) {
+      return {
+        rxBytes: current.rxBytes,
+        txBytes: current.txBytes,
+        rxBytesPerSecond: 0,
+        txBytesPerSecond: 0
+      };
+    }
+    const elapsedSeconds = Math.max((current.timestamp - previous.timestamp) / 1e3, 1);
+    return {
+      rxBytes: current.rxBytes,
+      txBytes: current.txBytes,
+      rxBytesPerSecond: Math.max((current.rxBytes - previous.rxBytes) / elapsedSeconds, 0),
+      txBytesPerSecond: Math.max((current.txBytes - previous.txBytes) / elapsedSeconds, 0)
+    };
+  }
+  async readNetworkTotals() {
+    try {
+      const { stdout } = await execFileAsync("netstat", ["-ibn"], { env: POSIX_ENV });
+      const totals = stdout.trim().split("\n").slice(1).reduce(
+        (sum, line) => {
+          const parts = line.trim().split(/\s+/);
+          const name = parts[0] ?? "";
+          const network = parts[2] ?? "";
+          if (!network.startsWith("<Link#") || name === "lo0" || name.endsWith("*")) {
+            return sum;
+          }
+          return {
+            rxBytes: sum.rxBytes + toNumber(parts[6]),
+            txBytes: sum.txBytes + toNumber(parts[9])
+          };
+        },
+        { rxBytes: 0, txBytes: 0 }
+      );
+      return {
+        ...totals,
+        timestamp: Date.now()
+      };
+    } catch (error) {
+      console.error("[SystemMonitor] netstat failed:", error);
+      return {
+        rxBytes: 0,
+        txBytes: 0,
+        timestamp: Date.now()
+      };
+    }
+  }
+  async getProjectMetrics() {
+    const processes = await this.getProcessList();
+    const childrenByParent = /* @__PURE__ */ new Map();
+    for (const item of processes) {
+      const children2 = childrenByParent.get(item.ppid) ?? [];
+      children2.push(item);
+      childrenByParent.set(item.ppid, children2);
+    }
+    const projectProcesses = [];
+    const seen = /* @__PURE__ */ new Set();
+    const visit = (pid) => {
+      if (seen.has(pid)) {
+        return;
+      }
+      seen.add(pid);
+      const processInfo = processes.find((item) => item.pid === pid);
+      if (processInfo) {
+        projectProcesses.push(processInfo);
+      }
+      for (const child of childrenByParent.get(pid) ?? []) {
+        visit(child.pid);
+      }
+    };
+    visit(process.pid);
+    for (const item of processes) {
+      if (this.isProjectProcess(item)) {
+        visit(item.pid);
+      }
+    }
+    const measuredProcesses = projectProcesses.filter((item) => !this.isCollectorProcess(item)).filter((item, index, source) => source.findIndex((match) => match.pid === item.pid) === index);
+    const cpuPercent = measuredProcesses.reduce((sum, item) => sum + item.cpuPercent, 0);
+    const memoryBytes = measuredProcesses.reduce((sum, item) => sum + item.memoryBytes, 0);
+    const totalMemory = import_os.default.totalmem();
+    return {
+      pid: process.pid,
+      processCount: measuredProcesses.length,
+      cpuPercent,
+      memoryPercent: totalMemory > 0 ? memoryBytes / totalMemory * 100 : 0,
+      memoryBytes,
+      processes: measuredProcesses.sort((left, right) => right.memoryBytes - left.memoryBytes).slice(0, 8).map((item) => ({
+        pid: item.pid,
+        cpuPercent: item.cpuPercent,
+        memoryBytes: item.memoryBytes,
+        name: item.name,
+        role: item.role
+      }))
+    };
+  }
+  isProjectProcess(item) {
+    const processText = item.command.toLowerCase();
+    const root = this.projectRoot.toLowerCase();
+    const appSupportPath = `/application support/${this.appName.toLowerCase()}`;
+    const projectToolPaths = [
+      `${root}/node_modules/.pnpm/electron`,
+      `${root}/node_modules/.bin/electron`,
+      `${root}/node_modules/.pnpm/vite`,
+      `${root}/node_modules/.bin/vite`
+    ];
+    const isPackaged = root.endsWith(".app");
+    return item.pid === process.pid || isPackaged && processText.includes(root) || processText.includes(`--app-path=${root}`) || processText.includes(appSupportPath) || projectToolPaths.some((toolPath) => processText.includes(toolPath));
+  }
+  isCollectorProcess(item) {
+    const processText = `${item.name} ${item.command}`.toLowerCase();
+    return item.ppid === process.pid && (processText.includes("ps -axo pid,ppid,%cpu,rss,comm,args") || processText.includes("netstat") || processText.includes("df -k /"));
+  }
+  async getProcessList() {
+    try {
+      const { stdout } = await execFileAsync("ps", ["-axo", "pid,ppid,user,%cpu,rss,comm,args"], { env: POSIX_ENV });
+      const lines = stdout.trim().split("\n");
+      const parsed = lines.slice(1).map((line) => {
+        const match = line.match(/^\s*(\d+)\s+(\d+)\s+(\S+)\s+([\d.]+)\s+(\d+)\s+(\S+)\s+(.*)$/);
+        if (!match) {
+          return null;
+        }
+        const commandPath = match[6] ?? "";
+        const command = match[7] ?? commandPath;
+        const name = commandPath.split("/").filter(Boolean).pop() ?? command.split(/\s+/)[0] ?? "process";
+        return {
+          pid: toNumber(match[1]),
+          ppid: toNumber(match[2]),
+          user: match[3] ?? "",
+          cpuPercent: toNumber(match[4]),
+          memoryBytes: toNumber(match[5]) * 1024,
+          name,
+          command,
+          role: this.getProcessRole(name, command)
+        };
+      }).filter((item) => Boolean(item));
+      return parsed;
+    } catch (error) {
+      console.error("[SystemMonitor] ps failed:", error);
+      return [];
+    }
+  }
+  async listAllProcesses() {
+    const processes = await this.getProcessList();
+    const currentUser = import_os.default.userInfo().username;
+    return processes.map((item) => {
+      const appPath = extractAppPath(item.command);
+      return {
+        pid: item.pid,
+        ppid: item.ppid,
+        user: item.user,
+        isOwnUser: item.user === currentUser,
+        cpuPercent: item.cpuPercent,
+        memoryBytes: item.memoryBytes,
+        name: item.name,
+        command: item.command,
+        appPath,
+        appName: appPath ? appNameFromPath(appPath) : null
+      };
+    });
+  }
+  killProcess(pid, signal = "SIGTERM") {
+    if (!Number.isInteger(pid) || pid <= 1) {
+      return { success: false, error: "Invalid PID", code: "EINVAL" };
+    }
+    try {
+      process.kill(pid, signal);
+      return { success: true };
+    } catch (error) {
+      return {
+        success: false,
+        error: error?.message ?? String(error),
+        code: error?.code
+      };
+    }
+  }
+  getProcessRole(name, command) {
+    const processText = `${name} ${command}`.toLowerCase();
+    if (processText.includes("--type=renderer")) return "Renderer";
+    if (processText.includes("--type=gpu-process")) return "GPU";
+    if (processText.includes("networkservice")) return "Network";
+    if (processText.includes("vite")) return "Dev server";
+    if (processText.includes("electron/cli")) return "Electron CLI";
+    if (processText.includes("electron.app/contents/macos/electron")) return "Main";
+    if (processText.includes("node")) return "Node";
+    return "Helper";
+  }
+};
+
+// src/electron/ssh-config-parser.ts
+var import_promises = require("fs/promises");
+var import_os2 = __toESM(require("os"), 1);
+var import_path = __toESM(require("path"), 1);
+var CONFIG_PATH = import_path.default.join(import_os2.default.homedir(), ".ssh", "config");
+var KNOWN_HOSTS_PATH = import_path.default.join(import_os2.default.homedir(), ".ssh", "known_hosts");
+var expandHome = (value) => value.startsWith("~") ? import_path.default.join(import_os2.default.homedir(), value.slice(1)) : value;
+var parseConfig = (text) => {
+  const blocks = [];
+  let current = null;
+  for (const rawLine of text.split("\n")) {
+    const line = rawLine.replace(/#.*$/, "").trim();
+    if (!line) continue;
+    const [keyword, ...rest] = line.split(/\s+/);
+    if (!keyword) continue;
+    const value = rest.join(" ");
+    const lowerKey = keyword.toLowerCase();
+    if (lowerKey === "host") {
+      current = { patterns: rest, options: /* @__PURE__ */ new Map() };
+      blocks.push(current);
+    } else if (current && value) {
+      current.options.set(lowerKey, value);
+    }
+  }
+  return blocks;
+};
+var isConcreteAlias = (alias) => !alias.includes("*") && !alias.includes("?") && !alias.startsWith("!");
+var blockToHosts = (block) => {
+  const hostname = block.options.get("hostname");
+  const user = block.options.get("user");
+  const portRaw = block.options.get("port");
+  const identityFile = block.options.get("identityfile");
+  const port = portRaw ? Number(portRaw) : void 0;
+  return block.patterns.filter(isConcreteAlias).map((alias) => ({
+    id: `config:${alias}`,
+    alias,
+    hostname: hostname ?? alias,
+    user,
+    port: Number.isFinite(port) ? port : void 0,
+    identityFile: identityFile ? expandHome(identityFile) : void 0,
+    source: "config"
+  }));
+};
+var parseKnownHostName = (rawName) => {
+  if (!rawName || rawName.startsWith("|")) return null;
+  if (rawName.includes("*") || rawName.includes("?")) return null;
+  const bracketMatch = rawName.match(/^\[([^\]]+)\]:(\d+)$/);
+  if (bracketMatch) {
+    return { hostname: bracketMatch[1], port: Number(bracketMatch[2]) };
+  }
+  return { hostname: rawName };
+};
+var parseKnownHosts = (text) => {
+  const seen = /* @__PURE__ */ new Set();
+  const result = [];
+  for (const rawLine of text.split("\n")) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#") || line.startsWith("|")) continue;
+    const [hostField] = line.split(/\s+/);
+    if (!hostField) continue;
+    for (const candidate of hostField.split(",")) {
+      const parsed = parseKnownHostName(candidate);
+      if (!parsed) continue;
+      const key = parsed.port ? `${parsed.hostname}:${parsed.port}` : parsed.hostname;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      result.push({
+        id: `known:${key}`,
+        alias: key,
+        hostname: parsed.hostname,
+        port: parsed.port,
+        source: "known_hosts"
+      });
+    }
+  }
+  return result;
+};
+var safeRead = async (file) => {
+  try {
+    return await (0, import_promises.readFile)(file, "utf8");
+  } catch {
+    return null;
+  }
+};
+async function listFileBasedHosts() {
+  const [configText, knownHostsText] = await Promise.all([
+    safeRead(CONFIG_PATH),
+    safeRead(KNOWN_HOSTS_PATH)
+  ]);
+  const configHosts = configText ? parseConfig(configText).flatMap(blockToHosts) : [];
+  const knownHosts = knownHostsText ? parseKnownHosts(knownHostsText) : [];
+  const configHostnames = new Set(
+    configHosts.flatMap((host) => [host.alias.toLowerCase(), host.hostname.toLowerCase()])
+  );
+  const knownOnly = knownHosts.filter(
+    (host) => !configHostnames.has(host.hostname.toLowerCase()) && !configHostnames.has(host.alias.toLowerCase())
+  );
+  return [...configHosts, ...knownOnly];
+}
+
+// src/electron/db.ts
+var import_fs2 = require("fs");
+var import_promises2 = require("fs/promises");
+var import_module = require("module");
+var import_path2 = __toESM(require("path"), 1);
+var import_electron = require("electron");
+var import_sql = __toESM(require("sql.js"), 1);
+var DB_TABLE_GROUPS = {
+  sshHosts: ["saved_hosts", "host_overrides", "port_forwards"],
+  mediaHistory: ["media_history"],
+  mediaStats: ["media_artist_stats", "media_track_stats"]
+};
+var require2 = (0, import_module.createRequire)(__cjs_meta_url);
+var DB_FILENAME = "ebala.db";
+var db = null;
+var dbPath = null;
+var persistQueue = Promise.resolve();
+var existingColumns = (database, table) => {
+  const stmt = database.prepare(`PRAGMA table_info(${table})`);
+  const names = /* @__PURE__ */ new Set();
+  try {
+    while (stmt.step()) {
+      const row = stmt.getAsObject();
+      if (row.name) names.add(row.name);
+    }
+  } finally {
+    stmt.free();
+  }
+  return names;
+};
+var addColumnIfMissing = (database, table, column, definition) => {
+  const columns = existingColumns(database, table);
+  if (!columns.has(column)) {
+    database.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  }
+};
+var runMigrations = (database) => {
+  database.exec(`
+        CREATE TABLE IF NOT EXISTS saved_hosts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            label TEXT NOT NULL,
+            hostname TEXT NOT NULL,
+            port INTEGER NOT NULL DEFAULT 22,
+            username TEXT NOT NULL,
+            auth_method TEXT NOT NULL DEFAULT 'password',
+            password_encrypted BLOB,
+            identity_file TEXT,
+            color TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_saved_hosts_label ON saved_hosts (label);
+
+        CREATE TABLE IF NOT EXISTS host_overrides (
+            host_id TEXT PRIMARY KEY,
+            custom_alias TEXT,
+            color TEXT,
+            notes TEXT,
+            hidden INTEGER NOT NULL DEFAULT 0,
+            username TEXT,
+            password_encrypted BLOB,
+            auth_method TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_host_overrides_hidden ON host_overrides (hidden);
+
+        CREATE TABLE IF NOT EXISTS port_forwards (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            host_id TEXT NOT NULL,
+            type TEXT NOT NULL CHECK (type IN ('local', 'remote')),
+            bind_address TEXT,
+            bind_port INTEGER NOT NULL,
+            target_host TEXT NOT NULL,
+            target_port INTEGER NOT NULL,
+            label TEXT,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_port_forwards_host ON port_forwards (host_id);
+
+        CREATE TABLE IF NOT EXISTS media_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT,
+            artist TEXT,
+            album TEXT,
+            bundle_id TEXT,
+            app_name TEXT,
+            artwork_url TEXT,
+            artwork_data_url TEXT,
+            duration_seconds INTEGER,
+            listened_seconds INTEGER NOT NULL DEFAULT 0,
+            started_at INTEGER NOT NULL,
+            ended_at INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_media_history_started ON media_history (started_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_media_history_artist ON media_history (artist);
+
+        -- Cumulative per-artist totals \u2014 survive media_history purges.
+        CREATE TABLE IF NOT EXISTS media_artist_stats (
+            artist TEXT PRIMARY KEY,
+            total_seconds INTEGER NOT NULL DEFAULT 0,
+            total_plays INTEGER NOT NULL DEFAULT 0,
+            first_played_at INTEGER NOT NULL,
+            last_played_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_media_artist_stats_total ON media_artist_stats (total_seconds DESC);
+
+        -- Cumulative per-track totals (keyed by artist + title) \u2014 also survive purges.
+        CREATE TABLE IF NOT EXISTS media_track_stats (
+            artist TEXT NOT NULL DEFAULT '',
+            title TEXT NOT NULL,
+            album TEXT,
+            artwork_url TEXT,
+            artwork_data_url TEXT,
+            total_seconds INTEGER NOT NULL DEFAULT 0,
+            total_plays INTEGER NOT NULL DEFAULT 0,
+            first_played_at INTEGER NOT NULL,
+            last_played_at INTEGER NOT NULL,
+            PRIMARY KEY (artist, title)
+        );
+        CREATE INDEX IF NOT EXISTS idx_media_track_stats_artist ON media_track_stats (artist, total_seconds DESC);
+        CREATE INDEX IF NOT EXISTS idx_media_track_stats_total ON media_track_stats (total_seconds DESC);
+    `);
+  addColumnIfMissing(database, "host_overrides", "username", "TEXT");
+  addColumnIfMissing(database, "host_overrides", "password_encrypted", "BLOB");
+  addColumnIfMissing(database, "host_overrides", "auth_method", "TEXT");
+  const hasArtistRows = (database.exec("SELECT 1 FROM media_artist_stats LIMIT 1")[0]?.values.length ?? 0) > 0;
+  const hasHistoryRows = (database.exec("SELECT 1 FROM media_history WHERE listened_seconds >= 5 LIMIT 1")[0]?.values.length ?? 0) > 0;
+  if (!hasArtistRows && hasHistoryRows) {
+    database.exec(`
+            INSERT INTO media_artist_stats (artist, total_seconds, total_plays, first_played_at, last_played_at)
+            SELECT artist, SUM(listened_seconds), COUNT(*), MIN(started_at), MAX(started_at)
+            FROM media_history
+            WHERE artist IS NOT NULL AND artist != '' AND listened_seconds >= 5
+            GROUP BY artist;
+
+            INSERT INTO media_track_stats (artist, title, album, artwork_url, artwork_data_url,
+                                           total_seconds, total_plays, first_played_at, last_played_at)
+            SELECT
+                COALESCE(artist, ''),
+                title,
+                MAX(album),
+                MAX(artwork_url),
+                MAX(artwork_data_url),
+                SUM(listened_seconds),
+                COUNT(*),
+                MIN(started_at),
+                MAX(started_at)
+            FROM media_history
+            WHERE title IS NOT NULL AND title != '' AND listened_seconds >= 5
+            GROUP BY COALESCE(artist, ''), title;
+        `);
+  }
+};
+async function openWithFallback(SQL, filePath) {
+  if (!(0, import_fs2.existsSync)(filePath)) return new SQL.Database();
+  const buffer = await (0, import_promises2.readFile)(filePath);
+  try {
+    const candidate = new SQL.Database(buffer);
+    candidate.exec("PRAGMA quick_check");
+    return candidate;
+  } catch (err) {
+    const stamp = (/* @__PURE__ */ new Date()).toISOString().replace(/[:.]/g, "-");
+    const quarantine = `${filePath}.corrupted-${stamp}`;
+    try {
+      await (0, import_promises2.rename)(filePath, quarantine);
+    } catch {
+    }
+    console.error(`[db] image malformed (${err?.message ?? err}); quarantined to ${quarantine}, starting fresh`);
+    return new SQL.Database();
+  }
+}
+async function initDb() {
+  if (db) return db;
+  const sqlJsDistPath = import_path2.default.dirname(require2.resolve("sql.js/dist/sql-wasm.js"));
+  const SQL = await (0, import_sql.default)({
+    locateFile: (file) => import_path2.default.join(sqlJsDistPath, file)
+  });
+  const userData = import_electron.app.getPath("userData");
+  if (!(0, import_fs2.existsSync)(userData)) {
+    (0, import_fs2.mkdirSync)(userData, { recursive: true });
+  }
+  dbPath = import_path2.default.join(userData, DB_FILENAME);
+  if ((0, import_fs2.existsSync)(dbPath)) {
+    db = await openWithFallback(SQL, dbPath);
+  } else {
+    db = new SQL.Database();
+  }
+  runMigrations(db);
+  await persist();
+  return db;
+}
+function getDb() {
+  if (!db) throw new Error("Database not initialized. Call initDb() first.");
+  return db;
+}
+function persist() {
+  persistQueue = persistQueue.then(async () => {
+    if (!db || !dbPath) return;
+    const data = db.export();
+    const tmpPath = `${dbPath}.tmp`;
+    try {
+      await (0, import_promises2.writeFile)(tmpPath, data);
+      await (0, import_promises2.rename)(tmpPath, dbPath);
+    } catch (err) {
+      try {
+        await (0, import_promises2.unlink)(tmpPath);
+      } catch {
+      }
+      throw err;
+    }
+  });
+  return persistQueue;
+}
+async function closeDb() {
+  await persistQueue;
+  if (db) {
+    db.close();
+    db = null;
+  }
+}
+function countRows(database, tables) {
+  let total = 0;
+  for (const table of tables) {
+    const result = database.exec(`SELECT COUNT(*) FROM ${table}`)[0];
+    const value = result?.values?.[0]?.[0];
+    total += typeof value === "number" ? value : Number(value ?? 0);
+  }
+  return total;
+}
+async function getDbStats() {
+  const database = getDb();
+  await persistQueue;
+  const sizeBytes = dbPath && (0, import_fs2.existsSync)(dbPath) ? (0, import_fs2.statSync)(dbPath).size : 0;
+  const groups = Object.fromEntries(
+    Object.entries(DB_TABLE_GROUPS).map(
+      ([key, tables]) => [key, { rowCount: countRows(database, tables), tables: [...tables] }]
+    )
+  );
+  return { sizeBytes, path: dbPath ?? "", groups };
+}
+async function clearTables(groups) {
+  const database = getDb();
+  const tables = /* @__PURE__ */ new Set();
+  for (const group of groups) {
+    const list = DB_TABLE_GROUPS[group];
+    if (!list) continue;
+    for (const table of list) tables.add(table);
+  }
+  if (tables.size > 0) {
+    database.exec("BEGIN TRANSACTION");
+    try {
+      for (const table of tables) {
+        database.exec(`DELETE FROM ${table}`);
+      }
+      database.exec("COMMIT");
+      database.exec("VACUUM");
+    } catch (error) {
+      database.exec("ROLLBACK");
+      throw error;
+    }
+    await persist();
+  }
+  return getDbStats();
+}
+
+// src/electron/credential-store.ts
+var import_electron2 = require("electron");
+function isCredentialEncryptionAvailable() {
+  return import_electron2.safeStorage.isEncryptionAvailable();
+}
+function encryptPassword(plain) {
+  if (!plain) return null;
+  if (!import_electron2.safeStorage.isEncryptionAvailable()) {
+    throw new Error("Credential encryption is not available on this system");
+  }
+  return import_electron2.safeStorage.encryptString(plain);
+}
+function decryptPassword(blob) {
+  if (!blob || blob.length === 0) return null;
+  if (!import_electron2.safeStorage.isEncryptionAvailable()) {
+    throw new Error("Credential encryption is not available on this system");
+  }
+  return import_electron2.safeStorage.decryptString(blob);
+}
+
+// src/electron/saved-hosts.ts
+var rowToHost = (row) => ({
+  id: row.id,
+  label: row.label,
+  hostname: row.hostname,
+  port: row.port,
+  username: row.username,
+  authMethod: row.auth_method,
+  hasPassword: Boolean(row.password_encrypted && row.password_encrypted.length > 0),
+  identityFile: row.identity_file ?? void 0,
+  color: row.color ?? void 0,
+  createdAt: row.created_at,
+  updatedAt: row.updated_at
+});
+var selectAll = `
+    SELECT id, label, hostname, port, username, auth_method,
+           password_encrypted, identity_file, color, created_at, updated_at
+    FROM saved_hosts
+    ORDER BY label COLLATE NOCASE ASC
+`;
+var selectById = `
+    SELECT id, label, hostname, port, username, auth_method,
+           password_encrypted, identity_file, color, created_at, updated_at
+    FROM saved_hosts WHERE id = $id
+`;
+var rowsFromStmt = (sql, params = []) => {
+  const db2 = getDb();
+  const stmt = db2.prepare(sql);
+  try {
+    stmt.bind(params);
+    const result = [];
+    while (stmt.step()) {
+      result.push(stmt.getAsObject());
+    }
+    return result;
+  } finally {
+    stmt.free();
+  }
+};
+function listSavedHosts() {
+  return rowsFromStmt(selectAll).map(rowToHost);
+}
+function getSavedHost(id) {
+  const rows = rowsFromStmt(selectById, { $id: id });
+  return rows[0] ? rowToHost(rows[0]) : null;
+}
+async function createSavedHost(input) {
+  const db2 = getDb();
+  const now = Date.now();
+  const encrypted = input.password ? encryptPassword(input.password) : null;
+  const port = input.port ?? 22;
+  db2.run(
+    `INSERT INTO saved_hosts
+            (label, hostname, port, username, auth_method, password_encrypted, identity_file, color, created_at, updated_at)
+         VALUES ($label, $hostname, $port, $username, $auth, $pwd, $identity, $color, $created, $updated)`,
+    {
+      $label: input.label,
+      $hostname: input.hostname,
+      $port: port,
+      $username: input.username,
+      $auth: input.authMethod,
+      $pwd: encrypted ?? null,
+      $identity: input.identityFile ?? null,
+      $color: input.color ?? null,
+      $created: now,
+      $updated: now
+    }
+  );
+  const result = db2.exec("SELECT last_insert_rowid() AS id");
+  const id = Number(result[0]?.values[0]?.[0] ?? 0);
+  await persist();
+  return getSavedHost(id);
+}
+async function updateSavedHost(id, input) {
+  const db2 = getDb();
+  const now = Date.now();
+  const port = input.port ?? 22;
+  const shouldUpdatePassword = input.password !== void 0 && input.password !== null;
+  const newEncrypted = shouldUpdatePassword && input.password !== "" ? encryptPassword(input.password) : null;
+  if (shouldUpdatePassword) {
+    db2.run(
+      `UPDATE saved_hosts SET
+                label=$label, hostname=$hostname, port=$port, username=$username,
+                auth_method=$auth, password_encrypted=$pwd, identity_file=$identity,
+                color=$color, updated_at=$updated
+             WHERE id=$id`,
+      {
+        $id: id,
+        $label: input.label,
+        $hostname: input.hostname,
+        $port: port,
+        $username: input.username,
+        $auth: input.authMethod,
+        $pwd: newEncrypted ?? null,
+        $identity: input.identityFile ?? null,
+        $color: input.color ?? null,
+        $updated: now
+      }
+    );
+  } else {
+    db2.run(
+      `UPDATE saved_hosts SET
+                label=$label, hostname=$hostname, port=$port, username=$username,
+                auth_method=$auth, identity_file=$identity, color=$color, updated_at=$updated
+             WHERE id=$id`,
+      {
+        $id: id,
+        $label: input.label,
+        $hostname: input.hostname,
+        $port: port,
+        $username: input.username,
+        $auth: input.authMethod,
+        $identity: input.identityFile ?? null,
+        $color: input.color ?? null,
+        $updated: now
+      }
+    );
+  }
+  await persist();
+  const updated = getSavedHost(id);
+  if (!updated) throw new Error(`Saved host ${id} not found after update`);
+  return updated;
+}
+async function deleteSavedHost(id) {
+  const db2 = getDb();
+  db2.run("DELETE FROM saved_hosts WHERE id = $id", { $id: id });
+  await persist();
+  return true;
+}
+function savedHostToSshHost(saved) {
+  return {
+    id: `saved:${saved.id}`,
+    alias: saved.label,
+    hostname: saved.hostname,
+    user: saved.username,
+    port: saved.port,
+    identityFile: saved.identityFile,
+    source: "saved",
+    savedId: saved.id,
+    authMethod: saved.authMethod,
+    color: saved.color
+  };
+}
+function getSavedHostPassword(id) {
+  const rows = rowsFromStmt(selectById, { $id: id });
+  const row = rows[0];
+  if (!row || !row.password_encrypted || row.password_encrypted.length === 0) return null;
+  return decryptPassword(Buffer.from(row.password_encrypted));
+}
+
+// src/electron/host-overrides.ts
+var rowToOverride = (row) => ({
+  hostId: row.host_id,
+  customAlias: row.custom_alias,
+  color: row.color,
+  notes: row.notes,
+  hidden: row.hidden === 1,
+  username: row.username,
+  hasPassword: Boolean(row.password_encrypted && row.password_encrypted.length > 0),
+  authMethod: row.auth_method,
+  createdAt: row.created_at,
+  updatedAt: row.updated_at
+});
+var queryRows = (sql, params = []) => {
+  const db2 = getDb();
+  const stmt = db2.prepare(sql);
+  try {
+    stmt.bind(params);
+    const out = [];
+    while (stmt.step()) out.push(stmt.getAsObject());
+    return out;
+  } finally {
+    stmt.free();
+  }
+};
+function listOverrides() {
+  return queryRows("SELECT * FROM host_overrides").map(rowToOverride);
+}
+function getOverride(hostId) {
+  const rows = queryRows("SELECT * FROM host_overrides WHERE host_id = $id", { $id: hostId });
+  return rows[0] ? rowToOverride(rows[0]) : null;
+}
+function getOverridePassword(hostId) {
+  const rows = queryRows(
+    "SELECT password_encrypted FROM host_overrides WHERE host_id = $id",
+    { $id: hostId }
+  );
+  const row = rows[0];
+  if (!row || !row.password_encrypted || row.password_encrypted.length === 0) return null;
+  return decryptPassword(Buffer.from(row.password_encrypted));
+}
+async function upsertOverride(hostId, patch) {
+  const db2 = getDb();
+  const now = Date.now();
+  const existing = getOverride(hostId);
+  const passwordShouldUpdate = patch.password !== void 0;
+  const passwordEncrypted = passwordShouldUpdate && patch.password ? encryptPassword(patch.password) : null;
+  if (existing) {
+    db2.run(
+      `UPDATE host_overrides SET
+                custom_alias = $alias,
+                color = $color,
+                notes = $notes,
+                hidden = $hidden,
+                username = $username,
+                auth_method = $auth,
+                ${passwordShouldUpdate ? "password_encrypted = $pwd," : ""}
+                updated_at = $updated
+             WHERE host_id = $id`,
+      {
+        $id: hostId,
+        $alias: patch.customAlias !== void 0 ? patch.customAlias : existing.customAlias,
+        $color: patch.color !== void 0 ? patch.color : existing.color,
+        $notes: patch.notes !== void 0 ? patch.notes : existing.notes,
+        $hidden: (patch.hidden !== void 0 ? patch.hidden : existing.hidden) ? 1 : 0,
+        $username: patch.username !== void 0 ? patch.username : existing.username,
+        $auth: patch.authMethod !== void 0 ? patch.authMethod : existing.authMethod,
+        ...passwordShouldUpdate ? { $pwd: passwordEncrypted ?? null } : {},
+        $updated: now
+      }
+    );
+  } else {
+    db2.run(
+      `INSERT INTO host_overrides
+                (host_id, custom_alias, color, notes, hidden,
+                 username, password_encrypted, auth_method,
+                 created_at, updated_at)
+             VALUES ($id, $alias, $color, $notes, $hidden,
+                     $username, $pwd, $auth,
+                     $created, $updated)`,
+      {
+        $id: hostId,
+        $alias: patch.customAlias ?? null,
+        $color: patch.color ?? null,
+        $notes: patch.notes ?? null,
+        $hidden: patch.hidden ? 1 : 0,
+        $username: patch.username ?? null,
+        $pwd: passwordEncrypted ?? null,
+        $auth: patch.authMethod ?? null,
+        $created: now,
+        $updated: now
+      }
+    );
+  }
+  await persist();
+  return getOverride(hostId);
+}
+async function deleteOverride(hostId) {
+  const db2 = getDb();
+  db2.run("DELETE FROM host_overrides WHERE host_id = $id", { $id: hostId });
+  await persist();
+}
+
+// src/electron/port-forwards.ts
+var rowToForward = (row) => ({
+  id: row.id,
+  hostId: row.host_id,
+  type: row.type,
+  bindAddress: row.bind_address,
+  bindPort: row.bind_port,
+  targetHost: row.target_host,
+  targetPort: row.target_port,
+  label: row.label,
+  enabled: row.enabled === 1,
+  createdAt: row.created_at,
+  updatedAt: row.updated_at
+});
+var queryRows2 = (sql, params = []) => {
+  const db2 = getDb();
+  const stmt = db2.prepare(sql);
+  try {
+    stmt.bind(params);
+    const out = [];
+    while (stmt.step()) out.push(stmt.getAsObject());
+    return out;
+  } finally {
+    stmt.free();
+  }
+};
+function listPortForwards(hostId) {
+  return queryRows2(
+    "SELECT * FROM port_forwards WHERE host_id = $host ORDER BY id ASC",
+    { $host: hostId }
+  ).map(rowToForward);
+}
+function listAllPortForwards() {
+  return queryRows2("SELECT * FROM port_forwards ORDER BY host_id, id").map(rowToForward);
+}
+async function createPortForward(hostId, input) {
+  const db2 = getDb();
+  const now = Date.now();
+  db2.run(
+    `INSERT INTO port_forwards
+            (host_id, type, bind_address, bind_port, target_host, target_port, label, enabled, created_at, updated_at)
+         VALUES ($host, $type, $bindAddr, $bindPort, $target, $targetPort, $label, $enabled, $created, $updated)`,
+    {
+      $host: hostId,
+      $type: input.type,
+      $bindAddr: input.bindAddress ?? null,
+      $bindPort: input.bindPort,
+      $target: input.targetHost,
+      $targetPort: input.targetPort,
+      $label: input.label ?? null,
+      $enabled: input.enabled ?? true ? 1 : 0,
+      $created: now,
+      $updated: now
+    }
+  );
+  const idRow = db2.exec("SELECT last_insert_rowid() AS id");
+  const id = Number(idRow[0]?.values[0]?.[0] ?? 0);
+  await persist();
+  return listPortForwards(hostId).find((forward) => forward.id === id);
+}
+async function updatePortForward(id, patch) {
+  const db2 = getDb();
+  const current = queryRows2("SELECT * FROM port_forwards WHERE id = $id", { $id: id })[0];
+  if (!current) return;
+  db2.run(
+    `UPDATE port_forwards SET
+            type = $type,
+            bind_address = $bindAddr,
+            bind_port = $bindPort,
+            target_host = $target,
+            target_port = $targetPort,
+            label = $label,
+            enabled = $enabled,
+            updated_at = $updated
+         WHERE id = $id`,
+    {
+      $id: id,
+      $type: patch.type ?? current.type,
+      $bindAddr: patch.bindAddress !== void 0 ? patch.bindAddress : current.bind_address,
+      $bindPort: patch.bindPort ?? current.bind_port,
+      $target: patch.targetHost ?? current.target_host,
+      $targetPort: patch.targetPort ?? current.target_port,
+      $label: patch.label !== void 0 ? patch.label : current.label,
+      $enabled: (patch.enabled !== void 0 ? patch.enabled : current.enabled === 1) ? 1 : 0,
+      $updated: Date.now()
+    }
+  );
+  await persist();
+}
+async function deletePortForward(id) {
+  const db2 = getDb();
+  db2.run("DELETE FROM port_forwards WHERE id = $id", { $id: id });
+  await persist();
+}
+
+// src/electron/ssh-hosts.ts
+var applyOverrides = (hosts) => {
+  const overrides = new Map(listOverrides().map((override) => [override.hostId, override]));
+  return hosts.map((host) => {
+    const override = overrides.get(host.id);
+    if (!override) return host;
+    return {
+      ...host,
+      originalAlias: host.alias,
+      customAlias: override.customAlias ?? void 0,
+      alias: override.customAlias || host.alias,
+      color: override.color ?? host.color,
+      notes: override.notes ?? void 0,
+      hidden: override.hidden,
+      originalUser: host.user,
+      user: override.username ?? host.user,
+      authMethod: override.authMethod ?? host.authMethod,
+      hasOverridePassword: override.hasPassword
+    };
+  });
+};
+var applyForwardCounts = (hosts) => {
+  const counts = /* @__PURE__ */ new Map();
+  for (const forward of listAllPortForwards()) {
+    if (!forward.enabled) continue;
+    counts.set(forward.hostId, (counts.get(forward.hostId) ?? 0) + 1);
+  }
+  return hosts.map((host) => {
+    const count = counts.get(host.id);
+    return count ? { ...host, forwardCount: count } : host;
+  });
+};
+async function listAllSshHosts() {
+  const [fileHosts, savedHosts] = await Promise.all([
+    listFileBasedHosts(),
+    Promise.resolve(listSavedHosts())
+  ]);
+  const merged = [...savedHosts.map(savedHostToSshHost), ...fileHosts];
+  const enriched = applyForwardCounts(applyOverrides(merged));
+  return {
+    visible: enriched.filter((host) => !host.hidden),
+    hidden: enriched.filter((host) => host.hidden)
+  };
+}
+
+// src/electron/ssh-manager.ts
 var import_events = require("events");
+var import_net2 = __toESM(require("net"), 1);
+var import_os3 = __toESM(require("os"), 1);
+var import_crypto = require("crypto");
+var import_node_pty = require("node-pty");
+var import_ssh2 = require("ssh2");
+
+// src/electron/host-resolver.ts
+var import_child_process2 = require("child_process");
+var import_promises3 = __toESM(require("dns/promises"), 1);
+var import_net = __toESM(require("net"), 1);
+var import_util2 = require("util");
+var execFileAsync2 = (0, import_util2.promisify)(import_child_process2.execFile);
+var IPV4_RE = /^(?:\d{1,3}\.){3}\d{1,3}$/;
+var IPV6_RE = /:/;
+function isIp(value) {
+  return IPV4_RE.test(value) || IPV6_RE.test(value);
+}
+async function lookupViaNode(hostname) {
+  try {
+    const result = await import_promises3.default.lookup(hostname, { family: 4, all: false });
+    return result.address;
+  } catch {
+  }
+  try {
+    const result = await import_promises3.default.lookup(hostname, { family: 6, all: false });
+    return result.address;
+  } catch {
+    return null;
+  }
+}
+async function lookupViaSystem(hostname) {
+  try {
+    const { stdout } = await execFileAsync2("dscacheutil", ["-q", "host", "-a", "name", hostname], {
+      timeout: 5e3
+    });
+    const match = stdout.match(/ipv4_address:\s*(\S+)/) ?? stdout.match(/ip_address:\s*(\S+)/);
+    return match ? match[1] : null;
+  } catch {
+    return null;
+  }
+}
+async function resolveHost(hostname) {
+  if (isIp(hostname)) {
+    return { address: hostname, via: "literal" };
+  }
+  if (hostname.endsWith(".ts.net") || hostname.includes(".tail")) {
+    const fromSystem2 = await lookupViaSystem(hostname);
+    if (fromSystem2) return { address: fromSystem2, via: "system" };
+  }
+  const fromNode = await lookupViaNode(hostname);
+  if (fromNode) return { address: fromNode, via: "dns" };
+  const fromSystem = await lookupViaSystem(hostname);
+  if (fromSystem) return { address: fromSystem, via: "system" };
+  return { address: hostname, via: "unresolved" };
+}
+async function tcpPreflight(address, port, timeoutMs = 8e3) {
+  return new Promise((resolve, reject) => {
+    const socket = import_net.default.connect({ host: address, port });
+    const timer = setTimeout(() => {
+      socket.destroy();
+      reject(new Error(`TCP timeout connecting to ${address}:${port}`));
+    }, timeoutMs);
+    socket.once("connect", () => {
+      clearTimeout(timer);
+      socket.end();
+      resolve();
+    });
+    socket.once("error", (err) => {
+      clearTimeout(timer);
+      reject(new Error(`TCP error: ${err.message}`));
+    });
+  });
+}
+
+// src/electron/ssh-manager.ts
+var enabledForwards = (hostId) => listPortForwards(hostId).filter((forward) => forward.enabled);
+var buildSshCliArgs = (host) => {
+  const args = [];
+  for (const forward of enabledForwards(host.id)) {
+    const bind = forward.bindAddress || (forward.type === "local" ? "127.0.0.1" : "");
+    const flag = forward.type === "local" ? "-L" : "-R";
+    const spec = bind ? `${bind}:${forward.bindPort}:${forward.targetHost}:${forward.targetPort}` : `${forward.bindPort}:${forward.targetHost}:${forward.targetPort}`;
+    args.push(flag, spec);
+  }
+  if (host.source === "config") {
+    args.push(host.alias);
+    return args;
+  }
+  if (host.port) args.push("-p", String(host.port));
+  args.push(host.hostname);
+  return args;
+};
+var SshManager = class extends import_events.EventEmitter {
+  sessions = /* @__PURE__ */ new Map();
+  emitData(sessionId, data) {
+    const session = this.sessions.get(sessionId);
+    if (session?.kind === "ssh2" && session.pendingPrefix) {
+      this.emit("data", { sessionId, data: session.pendingPrefix + data });
+      session.pendingPrefix = "";
+      return;
+    }
+    this.emit("data", { sessionId, data });
+  }
+  appendPending(session, data) {
+    session.pendingPrefix += data;
+    if (session.pendingPrefix.length > 4096) {
+      session.pendingPrefix = session.pendingPrefix.slice(-4096);
+    }
+  }
+  list() {
+    return Array.from(this.sessions.values()).map((session) => ({
+      sessionId: session.id,
+      host: session.host
+    }));
+  }
+  async create(host, cols = 120, rows = 30) {
+    if (host.source === "saved") {
+      return this.createSavedSsh2Session(host, cols, rows);
+    }
+    if (host.hasOverridePassword) {
+      return this.createOverrideSsh2Session(host, cols, rows);
+    }
+    return this.createPtySession(host, cols, rows);
+  }
+  async createOverrideSsh2Session(host, cols, rows) {
+    const password = getOverridePassword(host.id);
+    if (!password) {
+      throw new Error("Override password is unavailable or not stored");
+    }
+    if (!host.user) {
+      throw new Error("Override requires a username");
+    }
+    return this.openSsh2Stream({
+      host,
+      cols,
+      rows,
+      target: {
+        hostname: host.hostname,
+        port: host.port ?? 22,
+        username: host.user,
+        password
+      }
+    });
+  }
+  createPtySession(host, cols, rows) {
+    const id = (0, import_crypto.randomUUID)();
+    const args = buildSshCliArgs(host);
+    const pty = (0, import_node_pty.spawn)("ssh", args, {
+      name: "xterm-256color",
+      cols,
+      rows,
+      cwd: import_os3.default.homedir(),
+      env: process.env
+    });
+    const session = { id, host, kind: "pty", pty };
+    this.sessions.set(id, session);
+    pty.onData((data) => this.emit("data", { sessionId: id, data }));
+    pty.onExit(({ exitCode, signal }) => {
+      this.sessions.delete(id);
+      this.emit("exit", { sessionId: id, exitCode, signal });
+    });
+    return { sessionId: id };
+  }
+  async createSavedSsh2Session(host, cols, rows) {
+    const savedId = host.savedId;
+    if (!savedId) {
+      throw new Error("saved host missing savedId");
+    }
+    const saved = getSavedHost(savedId);
+    if (!saved) {
+      throw new Error(`Saved host ${savedId} not found`);
+    }
+    const password = saved.authMethod === "password" ? getSavedHostPassword(savedId) : null;
+    if (saved.authMethod === "password" && !password) {
+      throw new Error("Password is not stored for this host");
+    }
+    return this.openSsh2Stream({
+      host,
+      cols,
+      rows,
+      target: {
+        hostname: saved.hostname,
+        port: saved.port,
+        username: saved.username,
+        password: password ?? void 0
+      }
+    });
+  }
+  openSsh2Stream(args) {
+    const { host, cols, rows, target } = args;
+    const id = (0, import_crypto.randomUUID)();
+    const client = new import_ssh2.Client();
+    const resolvePromise = resolveHost(target.hostname);
+    const session = {
+      id,
+      host,
+      kind: "ssh2",
+      client,
+      stream: null,
+      forwardServers: [],
+      remoteForwards: [],
+      pendingPrefix: ""
+    };
+    this.sessions.set(id, session);
+    const fail = (err) => {
+      this.cleanupSsh2Tunnels(session);
+      this.sessions.delete(id);
+      this.emit("exit", { sessionId: id, exitCode: 1, error: err.message });
+    };
+    client.on("error", (err) => {
+      const hint = /handshake/i.test(err.message) ? " (TCP works but the SSH service did not respond. Wrong port, sshd down, or a Tailscale ACL blocking port?)" : "";
+      this.emitData(id, `\r
+\x1B[31mError: ${err.message}${hint}\x1B[0m\r
+`);
+      fail(err);
+    });
+    client.on("end", () => {
+      this.cleanupSsh2Tunnels(session);
+      this.sessions.delete(id);
+      this.emit("exit", { sessionId: id, exitCode: 0 });
+    });
+    client.on("tcp connection", (info, accept, reject) => {
+      const match = session.remoteForwards.find(
+        (f) => f.address === info.destIP && f.port === info.destPort
+      );
+      const forwardConfig = match ? enabledForwards(host.id).find(
+        (f) => f.type === "remote" && (f.bindAddress || "") === info.destIP && f.bindPort === info.destPort
+      ) : void 0;
+      if (!forwardConfig) {
+        reject();
+        return;
+      }
+      const local = import_net2.default.connect(forwardConfig.targetPort, forwardConfig.targetHost);
+      local.on("error", () => reject());
+      local.on("connect", () => {
+        const remote = accept();
+        local.pipe(remote).pipe(local);
+      });
+    });
+    client.on("ready", () => {
+      this.emitData(
+        id,
+        `\x1B[32mConnected to ${target.username}@${target.hostname}:${target.port}\x1B[0m\r
+`
+      );
+      this.setupSsh2Tunnels(session);
+      client.shell({ term: "xterm-256color", cols, rows }, (err, stream) => {
+        if (err) {
+          fail(err);
+          return;
+        }
+        session.stream = stream;
+        stream.on("data", (data) => {
+          this.emit("data", { sessionId: id, data: data.toString("utf-8") });
+        });
+        stream.stderr.on("data", (data) => {
+          this.emit("data", { sessionId: id, data: data.toString("utf-8") });
+        });
+        stream.on("close", () => {
+          try {
+            client.end();
+          } catch {
+          }
+        });
+      });
+    });
+    resolvePromise.then(async ({ address, via }) => {
+      if (via === "unresolved") {
+        this.emitData(
+          id,
+          `\r
+\x1B[31mCould not resolve ${target.hostname}. For Tailscale: try the 100.x.x.x IP or full \`.ts.net\` name.\x1B[0m\r
+`
+        );
+        fail(new Error(`Could not resolve ${target.hostname}`));
+        return;
+      }
+      if (via !== "literal") {
+        this.appendPending(
+          session,
+          `\x1B[36mResolved ${target.hostname} \u2192 ${address} (${via})\x1B[0m\r
+`
+        );
+      }
+      try {
+        await tcpPreflight(address, target.port, 8e3);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        this.emitData(
+          id,
+          `\r
+\x1B[31m${message}. Tailscale tunnel up? Try \`tailscale status\` / \`tailscale ping ${target.hostname}\`.\x1B[0m\r
+`
+        );
+        fail(err instanceof Error ? err : new Error(message));
+        return;
+      }
+      this.appendPending(session, `\x1B[36mTCP ok ${address}:${target.port}, waiting for SSH banner\u2026\x1B[0m\r
+`);
+      try {
+        client.connect({
+          host: address,
+          port: target.port,
+          username: target.username,
+          password: target.password,
+          readyTimeout: 3e4,
+          keepaliveInterval: 3e4
+        });
+      } catch (err) {
+        fail(err);
+      }
+    }).catch((err) => fail(err));
+    return { sessionId: id };
+  }
+  setupSsh2Tunnels(session) {
+    const forwards = enabledForwards(session.host.id);
+    if (forwards.length === 0) return;
+    const emitInfo = (message) => {
+      this.emit("data", { sessionId: session.id, data: `\x1B[36m${message}\x1B[0m\r
+` });
+    };
+    const emitError = (message) => {
+      this.emit("data", { sessionId: session.id, data: `\x1B[31m${message}\x1B[0m\r
+` });
+    };
+    for (const forward of forwards) {
+      if (forward.type === "local") {
+        const bindAddr = forward.bindAddress || "127.0.0.1";
+        const server = import_net2.default.createServer((local) => {
+          session.client.forwardOut(
+            bindAddr,
+            forward.bindPort,
+            forward.targetHost,
+            forward.targetPort,
+            (err, remote) => {
+              if (err) {
+                local.end();
+                emitError(
+                  `Tunnel ${bindAddr}:${forward.bindPort} \u2192 ${forward.targetHost}:${forward.targetPort} failed: ${err.message}`
+                );
+                return;
+              }
+              local.pipe(remote).pipe(local);
+            }
+          );
+        });
+        server.on("error", (err) => {
+          emitError(`Tunnel ${bindAddr}:${forward.bindPort} error: ${err.message}`);
+        });
+        server.listen(forward.bindPort, bindAddr, () => {
+          emitInfo(
+            `Tunnel -L ${bindAddr}:${forward.bindPort} \u2192 ${forward.targetHost}:${forward.targetPort} ready`
+          );
+        });
+        session.forwardServers.push(server);
+      } else {
+        const bindAddr = forward.bindAddress || "";
+        session.client.forwardIn(bindAddr, forward.bindPort, (err, port) => {
+          if (err) {
+            emitError(`Reverse tunnel ${bindAddr}:${forward.bindPort} failed: ${err.message}`);
+            return;
+          }
+          session.remoteForwards.push({ address: bindAddr, port });
+          emitInfo(
+            `Tunnel -R ${bindAddr}:${port} \u2192 ${forward.targetHost}:${forward.targetPort} ready`
+          );
+        });
+      }
+    }
+  }
+  cleanupSsh2Tunnels(session) {
+    for (const server of session.forwardServers) {
+      try {
+        server.close();
+      } catch {
+      }
+    }
+    session.forwardServers = [];
+    for (const remote of session.remoteForwards) {
+      try {
+        session.client.unforwardIn(remote.address, remote.port, () => {
+        });
+      } catch {
+      }
+    }
+    session.remoteForwards = [];
+  }
+  write(sessionId, data) {
+    const session = this.sessions.get(sessionId);
+    if (!session) return false;
+    if (session.kind === "pty") {
+      session.pty.write(data);
+      return true;
+    }
+    if (session.stream) {
+      session.stream.write(data);
+      return true;
+    }
+    return false;
+  }
+  resize(sessionId, cols, rows) {
+    const session = this.sessions.get(sessionId);
+    if (!session) return false;
+    const safeCols = Math.max(cols, 1);
+    const safeRows = Math.max(rows, 1);
+    try {
+      if (session.kind === "pty") {
+        session.pty.resize(safeCols, safeRows);
+        return true;
+      }
+      if (session.stream) {
+        session.stream.setWindow(safeRows, safeCols, 0, 0);
+        return true;
+      }
+      return false;
+    } catch {
+      return false;
+    }
+  }
+  close(sessionId) {
+    const session = this.sessions.get(sessionId);
+    if (!session) return false;
+    try {
+      if (session.kind === "pty") {
+        session.pty.kill();
+      } else {
+        this.cleanupSsh2Tunnels(session);
+        session.stream?.end();
+        session.client.end();
+      }
+    } catch {
+    }
+    this.sessions.delete(sessionId);
+    return true;
+  }
+  dispose() {
+    for (const session of this.sessions.values()) {
+      try {
+        if (session.kind === "pty") {
+          session.pty.kill();
+        } else {
+          this.cleanupSsh2Tunnels(session);
+          session.stream?.end();
+          session.client.end();
+        }
+      } catch {
+      }
+    }
+    this.sessions.clear();
+  }
+};
+
+// src/electron/settings-store.ts
+var import_fs3 = require("fs");
+var import_promises4 = require("fs/promises");
+var import_path3 = __toESM(require("path"), 1);
+var import_electron3 = require("electron");
+var SETTINGS_FILENAME = "app-settings.json";
+var DEFAULT_SETTINGS = {
+  theme: "system",
+  popup: {
+    showMedia: true,
+    showBluetooth: true,
+    showSystem: true,
+    showSsh: true,
+    showDocker: true
+  },
+  hotkey: {
+    enabled: true,
+    combo: "Cmd+Shift+M"
+  },
+  plugins: {
+    disabled: []
+  }
+};
+var cached = null;
+var writeQueue = Promise.resolve();
+function settingsPath() {
+  const userData = import_electron3.app.getPath("userData");
+  if (!(0, import_fs3.existsSync)(userData)) (0, import_fs3.mkdirSync)(userData, { recursive: true });
+  return import_path3.default.join(userData, SETTINGS_FILENAME);
+}
+function mergeWithDefaults(partial) {
+  return {
+    theme: partial?.theme ?? DEFAULT_SETTINGS.theme,
+    popup: { ...DEFAULT_SETTINGS.popup, ...partial?.popup ?? {} },
+    hotkey: { ...DEFAULT_SETTINGS.hotkey, ...partial?.hotkey ?? {} },
+    plugins: { ...DEFAULT_SETTINGS.plugins, ...partial?.plugins ?? {} }
+  };
+}
+async function loadSettings() {
+  if (cached) return cached;
+  const file = settingsPath();
+  if (!(0, import_fs3.existsSync)(file)) {
+    cached = { ...DEFAULT_SETTINGS, popup: { ...DEFAULT_SETTINGS.popup }, plugins: { disabled: [...DEFAULT_SETTINGS.plugins.disabled] } };
+    return cached;
+  }
+  try {
+    const raw = await (0, import_promises4.readFile)(file, "utf8");
+    cached = mergeWithDefaults(JSON.parse(raw));
+    return cached;
+  } catch {
+    cached = { ...DEFAULT_SETTINGS, popup: { ...DEFAULT_SETTINGS.popup }, plugins: { disabled: [...DEFAULT_SETTINGS.plugins.disabled] } };
+    return cached;
+  }
+}
+async function updateSettings(patch) {
+  const current = await loadSettings();
+  const next = {
+    theme: patch.theme ?? current.theme,
+    popup: { ...current.popup, ...patch.popup ?? {} },
+    hotkey: { ...current.hotkey, ...patch.hotkey ?? {} },
+    plugins: { ...current.plugins, ...patch.plugins ?? {} }
+  };
+  cached = next;
+  const file = settingsPath();
+  writeQueue = writeQueue.then(() => (0, import_promises4.writeFile)(file, JSON.stringify(next, null, 2)));
+  await writeQueue;
+  return next;
+}
+
+// src/electron/ssh-file-ops.ts
+var import_child_process3 = require("child_process");
+var import_os4 = __toESM(require("os"), 1);
+var import_path4 = __toESM(require("path"), 1);
+var import_util3 = require("util");
+var execFileAsync3 = (0, import_util3.promisify)(import_child_process3.execFile);
+var KNOWN_HOSTS_PATH2 = import_path4.default.join(import_os4.default.homedir(), ".ssh", "known_hosts");
+async function removeFromKnownHosts(hostname) {
+  if (!hostname || hostname.trim().length === 0) {
+    return { success: false, error: "hostname is empty" };
+  }
+  try {
+    await execFileAsync3("ssh-keygen", ["-R", hostname, "-f", KNOWN_HOSTS_PATH2], {
+      timeout: 1e4
+    });
+    return { success: true };
+  } catch (error) {
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : String(error)
+    };
+  }
+}
+
+// src/electron/local-fs.ts
+var import_promises5 = require("fs/promises");
+var import_os5 = __toESM(require("os"), 1);
+var import_path5 = __toESM(require("path"), 1);
+async function listLocal(dirPath) {
+  const target = dirPath || import_os5.default.homedir();
+  const entries = await (0, import_promises5.readdir)(target, { withFileTypes: true });
+  const results = await Promise.all(
+    entries.map(async (entry) => {
+      const full = import_path5.default.join(target, entry.name);
+      try {
+        const stats = await (0, import_promises5.stat)(full);
+        return {
+          name: entry.name,
+          path: full,
+          isDir: stats.isDirectory(),
+          isLink: entry.isSymbolicLink(),
+          size: stats.size,
+          mtimeMs: stats.mtimeMs
+        };
+      } catch {
+        return null;
+      }
+    })
+  );
+  return results.filter((entry) => entry !== null).sort((a, b) => {
+    if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
+    return a.name.localeCompare(b.name, void 0, { sensitivity: "base" });
+  });
+}
+function localHome() {
+  return import_os5.default.homedir();
+}
+
+// src/electron/sftp-manager.ts
+var import_crypto2 = require("crypto");
+var import_ssh22 = require("ssh2");
+
+// src/electron/ssh-credentials.ts
+var import_fs4 = require("fs");
+var import_os6 = __toESM(require("os"), 1);
+var import_path6 = __toESM(require("path"), 1);
+function expandHome2(filePath) {
+  if (filePath.startsWith("~/")) return import_path6.default.join(import_os6.default.homedir(), filePath.slice(2));
+  if (filePath === "~") return import_os6.default.homedir();
+  return filePath;
+}
+function loadPrivateKey(filePath) {
+  if (!filePath) return void 0;
+  const expanded = expandHome2(filePath);
+  if (!(0, import_fs4.existsSync)(expanded)) return void 0;
+  try {
+    return (0, import_fs4.readFileSync)(expanded);
+  } catch {
+    return void 0;
+  }
+}
+function resolveCredentials(host) {
+  const agentSocket = process.env.SSH_AUTH_SOCK || void 0;
+  if (host.source === "saved" && host.savedId !== void 0) {
+    const saved = getSavedHost(host.savedId);
+    if (!saved) throw new Error(`Saved host ${host.savedId} not found`);
+    const password = saved.authMethod === "password" ? getSavedHostPassword(host.savedId) : null;
+    const identityFile = saved.identityFile ?? void 0;
+    return {
+      hostname: saved.hostname,
+      port: saved.port,
+      username: saved.username,
+      password: password ?? void 0,
+      identityFile,
+      privateKey: loadPrivateKey(identityFile),
+      agentSocket
+    };
+  }
+  if (host.hasOverridePassword) {
+    const password = getOverridePassword(host.id);
+    if (!host.user) throw new Error("Override credential requires a username");
+    return {
+      hostname: host.hostname,
+      port: host.port ?? 22,
+      username: host.user,
+      password: password ?? void 0,
+      identityFile: host.identityFile,
+      privateKey: loadPrivateKey(host.identityFile),
+      agentSocket
+    };
+  }
+  return {
+    hostname: host.hostname,
+    port: host.port ?? 22,
+    username: host.user ?? import_os6.default.userInfo().username,
+    identityFile: host.identityFile,
+    privateKey: loadPrivateKey(host.identityFile),
+    agentSocket
+  };
+}
+
+// src/electron/sftp-manager.ts
+var SftpManager = class {
+  sessions = /* @__PURE__ */ new Map();
+  async connect(host) {
+    const creds = resolveCredentials(host);
+    const resolved = await resolveHost(creds.hostname);
+    if (resolved.via === "unresolved") {
+      throw new Error(
+        `Could not resolve ${creds.hostname}. For Tailscale, try the 100.x.x.x IP or full .ts.net name.`
+      );
+    }
+    try {
+      await tcpPreflight(resolved.address, creds.port, 8e3);
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      throw new Error(
+        `${detail}. Tailscale tunnel up? Try \`tailscale ping ${creds.hostname}\`.`
+      );
+    }
+    const client = new import_ssh22.Client();
+    const ready = new Promise((resolve, reject) => {
+      client.once("ready", () => resolve());
+      client.once("error", (err) => reject(err));
+    });
+    client.connect({
+      host: resolved.address,
+      port: creds.port,
+      username: creds.username,
+      password: creds.password,
+      privateKey: creds.privateKey,
+      agent: creds.agentSocket,
+      tryKeyboard: false,
+      readyTimeout: 15e3,
+      keepaliveInterval: 3e4
+    });
+    await ready;
+    const sftp = await new Promise((resolve, reject) => {
+      client.sftp((err, wrapper) => err ? reject(err) : resolve(wrapper));
+    });
+    const homePath = await new Promise((resolve) => {
+      sftp.realpath(".", (err, resolved2) => {
+        if (err || !resolved2) resolve("/");
+        else resolve(resolved2);
+      });
+    });
+    const id = (0, import_crypto2.randomUUID)();
+    this.sessions.set(id, { id, hostId: host.id, client, sftp, homePath });
+    client.on("close", () => {
+      this.sessions.delete(id);
+    });
+    return { sessionId: id, homePath };
+  }
+  async list(sessionId, dirPath) {
+    const session = this.requireSession(sessionId);
+    const target = dirPath || session.homePath;
+    const resolved = await new Promise((resolve, reject) => {
+      session.sftp.realpath(target, (err, value) => err ? reject(err) : resolve(value));
+    });
+    const entries = await new Promise((resolve, reject) => {
+      session.sftp.readdir(resolved, (err, list) => err ? reject(err) : resolve(list));
+    });
+    return entries.filter((entry) => entry.filename !== "." && entry.filename !== "..").map((entry) => ({
+      name: entry.filename,
+      path: posixJoin(resolved, entry.filename),
+      isDir: entry.attrs.isDirectory(),
+      isLink: entry.attrs.isSymbolicLink(),
+      size: entry.attrs.size ?? 0,
+      mtimeMs: (entry.attrs.mtime ?? 0) * 1e3
+    })).sort(compareEntries);
+  }
+  async mkdir(sessionId, dirPath) {
+    const session = this.requireSession(sessionId);
+    await new Promise((resolve, reject) => {
+      session.sftp.mkdir(dirPath, (err) => err ? reject(err) : resolve());
+    });
+  }
+  async remove(sessionId, targetPath, isDir) {
+    const session = this.requireSession(sessionId);
+    await new Promise((resolve, reject) => {
+      const op = isDir ? session.sftp.rmdir.bind(session.sftp) : session.sftp.unlink.bind(session.sftp);
+      op(targetPath, (err) => err ? reject(err) : resolve());
+    });
+  }
+  disconnect(sessionId) {
+    const session = this.sessions.get(sessionId);
+    if (!session) return false;
+    try {
+      session.client.end();
+    } catch {
+    }
+    this.sessions.delete(sessionId);
+    return true;
+  }
+  dispose() {
+    for (const session of this.sessions.values()) {
+      try {
+        session.client.end();
+      } catch {
+      }
+    }
+    this.sessions.clear();
+  }
+  requireSession(sessionId) {
+    const session = this.sessions.get(sessionId);
+    if (!session) throw new Error(`SFTP session ${sessionId} not found`);
+    return session;
+  }
+};
+function posixJoin(dir, name) {
+  if (dir.endsWith("/")) return `${dir}${name}`;
+  return `${dir}/${name}`;
+}
+function compareEntries(a, b) {
+  if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
+  return a.name.localeCompare(b.name, void 0, { sensitivity: "base" });
+}
+
+// src/electron/rsync-manager.ts
+var import_child_process4 = require("child_process");
+var import_crypto3 = require("crypto");
+var import_events2 = require("events");
+var import_os7 = __toESM(require("os"), 1);
+var import_path7 = __toESM(require("path"), 1);
+var PROGRESS_LINE = /([\d,]+)\s+(\d+)%\s+([\d.]+\S+)\s+(\d+:\d{2}:\d{2})/;
+function expandHome3(filePath) {
+  if (filePath.startsWith("~/")) return import_path7.default.join(import_os7.default.homedir(), filePath.slice(2));
+  if (filePath === "~") return import_os7.default.homedir();
+  return filePath;
+}
+function buildSshFlag(creds, usingPassword) {
+  const parts = ["ssh", "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=15"];
+  if (!usingPassword) parts.push("-o", "BatchMode=yes");
+  if (creds.port && creds.port !== 22) parts.push("-p", String(creds.port));
+  if (creds.identityFile) parts.push("-i", expandHome3(creds.identityFile));
+  return parts.join(" ");
+}
+function detectSshpass() {
+  try {
+    (0, import_child_process4.execFileSync)("which", ["sshpass"], { stdio: ["ignore", "pipe", "ignore"] });
+    return true;
+  } catch {
+    return false;
+  }
+}
+function detectRsyncMajor() {
+  try {
+    const output = (0, import_child_process4.execFileSync)("rsync", ["--version"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"]
+    });
+    const match = output.match(/version\s+(\d+)\./);
+    return match ? Number(match[1]) : 0;
+  } catch {
+    return 0;
+  }
+}
+function shellQuote(value) {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+var RsyncManager = class extends import_events2.EventEmitter {
+  transfers = /* @__PURE__ */ new Map();
+  sshpassAvailable = null;
+  rsyncMajor = null;
+  isSshpassAvailable() {
+    if (this.sshpassAvailable === null) {
+      this.sshpassAvailable = detectSshpass();
+    }
+    return this.sshpassAvailable;
+  }
+  getRsyncMajor() {
+    if (this.rsyncMajor === null) {
+      this.rsyncMajor = detectRsyncMajor();
+    }
+    return this.rsyncMajor;
+  }
+  list() {
+    return Array.from(this.transfers.values()).map(stripInternal);
+  }
+  async start(host, options) {
+    const creds = resolveCredentials(host);
+    const usingPassword = Boolean(creds.password);
+    if (usingPassword && !this.isSshpassAvailable()) {
+      throw new Error(
+        "This host needs a password, but sshpass is not installed. Install it via `brew install hudochenkov/sshpass/sshpass` or switch to key auth."
+      );
+    }
+    const id = (0, import_crypto3.randomUUID)();
+    const sshFlag = buildSshFlag(creds, usingPassword);
+    const modernRsync = this.getRsyncMajor() >= 3;
+    const remoteSpec = modernRsync ? `${creds.username}@${creds.hostname}:${options.remotePath}` : `${creds.username}@${creds.hostname}:${shellQuote(options.remotePath)}`;
+    const rsyncArgs = ["-a"];
+    if (modernRsync) {
+      rsyncArgs.push("--info=progress2", "--protect-args");
+    } else {
+      rsyncArgs.push("--progress");
+    }
+    rsyncArgs.push("--partial", "-e", sshFlag);
+    if (options.compress) rsyncArgs.push("--compress");
+    if (options.mirror) rsyncArgs.push("--delete");
+    if (options.dryRun) rsyncArgs.push("--dry-run");
+    if (options.direction === "upload") {
+      rsyncArgs.push(options.localPath, remoteSpec);
+    } else {
+      rsyncArgs.push(remoteSpec, options.localPath);
+    }
+    let command;
+    let args;
+    let env = { ...process.env };
+    if (usingPassword) {
+      command = "sshpass";
+      args = ["-e", "rsync", ...rsyncArgs];
+      env = { ...env, SSHPASS: creds.password };
+    } else {
+      command = "rsync";
+      args = rsyncArgs;
+    }
+    const child = (0, import_child_process4.spawn)(command, args, { env });
+    const transfer = {
+      id,
+      hostId: host.id,
+      hostAlias: host.alias,
+      direction: options.direction,
+      localPath: options.localPath,
+      remotePath: options.remotePath,
+      options,
+      state: "running",
+      bytesTransferred: 0,
+      percent: 0,
+      bytesPerSecond: 0,
+      eta: "",
+      log: [],
+      stderr: "",
+      command: `${command} ${args.join(" ")}`,
+      startedAt: Date.now(),
+      process: child,
+      stdoutBuffer: ""
+    };
+    this.transfers.set(id, transfer);
+    this.emit("progress", stripInternal(transfer));
+    child.stdout?.on("data", (chunk) => this.handleStdout(transfer, chunk));
+    child.stderr?.on("data", (chunk) => this.handleStderr(transfer, chunk));
+    child.on("error", (err) => {
+      transfer.state = "error";
+      transfer.error = err.message;
+      transfer.finishedAt = Date.now();
+      this.emit("done", stripInternal(transfer));
+      this.transfers.delete(id);
+    });
+    child.on("close", (code) => {
+      if (transfer.state === "cancelled") {
+        transfer.finishedAt = Date.now();
+        transfer.exitCode = code ?? void 0;
+        this.emit("done", stripInternal(transfer));
+        this.transfers.delete(id);
+        return;
+      }
+      transfer.exitCode = code ?? void 0;
+      transfer.finishedAt = Date.now();
+      if (code === 0) {
+        transfer.state = "done";
+        transfer.percent = 100;
+      } else {
+        transfer.state = "error";
+        transfer.error = transfer.stderr.trim() || `rsync exited with code ${code}`;
+      }
+      this.emit("done", stripInternal(transfer));
+      this.transfers.delete(id);
+    });
+    return { transferId: id };
+  }
+  cancel(transferId) {
+    const transfer = this.transfers.get(transferId);
+    if (!transfer) return false;
+    transfer.state = "cancelled";
+    try {
+      transfer.process.kill("SIGINT");
+    } catch {
+    }
+    setTimeout(() => {
+      const stale = this.transfers.get(transferId);
+      if (stale && !stale.process.killed) {
+        try {
+          stale.process.kill("SIGKILL");
+        } catch {
+        }
+      }
+    }, 2e3);
+    return true;
+  }
+  dispose() {
+    for (const transfer of this.transfers.values()) {
+      try {
+        transfer.process.kill("SIGKILL");
+      } catch {
+      }
+    }
+    this.transfers.clear();
+  }
+  handleStdout(transfer, chunk) {
+    transfer.stdoutBuffer += chunk.toString("utf8");
+    const segments = transfer.stdoutBuffer.split(/[\r\n]+/);
+    transfer.stdoutBuffer = segments.pop() ?? "";
+    for (const segment of segments) {
+      const trimmed = segment.trim();
+      if (!trimmed) continue;
+      const match = trimmed.match(PROGRESS_LINE);
+      if (match) {
+        transfer.bytesTransferred = Number(match[1].replace(/,/g, ""));
+        transfer.percent = Number(match[2]);
+        transfer.bytesPerSecond = parseRate(match[3]);
+        transfer.eta = match[4];
+        this.emit("progress", stripInternal(transfer));
+      } else {
+        transfer.log.push(trimmed);
+        if (transfer.log.length > 50) transfer.log.shift();
+      }
+    }
+  }
+  handleStderr(transfer, chunk) {
+    transfer.stderr += chunk.toString("utf8");
+    if (transfer.stderr.length > 4e3) {
+      transfer.stderr = transfer.stderr.slice(-4e3);
+    }
+    this.emit("progress", stripInternal(transfer));
+  }
+};
+function stripInternal(transfer) {
+  const { process: _process, stdoutBuffer: _stdout, ...rest } = transfer;
+  return rest;
+}
+function parseRate(token) {
+  const match = token.match(/^([\d.]+)([kMG]?B)\/s$/);
+  if (!match) return 0;
+  const value = Number(match[1]);
+  const unit = match[2];
+  const multiplier = unit === "GB" ? 1024 ** 3 : unit === "MB" ? 1024 ** 2 : unit === "kB" ? 1024 : 1;
+  return value * multiplier;
+}
+
+// src/electron/disk-scanner.ts
+var import_fs5 = require("fs");
+var import_promises6 = require("fs/promises");
+var import_path8 = __toESM(require("path"), 1);
+var import_events3 = require("events");
+var SKIP_BASENAMES = /* @__PURE__ */ new Set([
+  ".Spotlight-V100",
+  ".Trashes",
+  ".fseventsd",
+  ".DocumentRevisions-V100",
+  ".TemporaryItems",
+  ".MobileBackups",
+  ".PKInstallSandboxManager",
+  ".HFS+ Private Directory Data"
+]);
+var SKIP_PATH_PREFIXES = [
+  "/dev",
+  "/Volumes",
+  "/private/var/folders",
+  "/.vol",
+  "/System/Volumes/VM",
+  "/System/Volumes/Preboot",
+  "/System/Volumes/Update"
+];
+var SKIP_PATH_CONTAINS = [
+  "/Library/Mobile Documents",
+  "/.MobileBackups",
+  "/.PreviousSystemInformation",
+  "/Library/Application Support/MobileSync",
+  "/Library/CloudStorage"
+];
+function shouldSkip(filePath, basename) {
+  if (SKIP_BASENAMES.has(basename)) return true;
+  for (const prefix of SKIP_PATH_PREFIXES) {
+    if (filePath === prefix || filePath.startsWith(prefix + "/")) return true;
+  }
+  for (const fragment of SKIP_PATH_CONTAINS) {
+    if (filePath.includes(fragment)) return true;
+  }
+  return false;
+}
+var KEEP_DEPTH = 12;
+var PROGRESS_EVERY_PATHS = 250;
+var FS_TIMEOUT_MS = 5e3;
+var MAX_CONCURRENT_FS = 32;
+var Semaphore = class {
+  active = 0;
+  waiters = [];
+  max;
+  constructor(max) {
+    this.max = max;
+  }
+  async acquire() {
+    if (this.active >= this.max) {
+      await new Promise((resolve) => this.waiters.push(resolve));
+    }
+    this.active += 1;
+  }
+  release() {
+    this.active -= 1;
+    const next = this.waiters.shift();
+    if (next) next();
+  }
+};
+async function withTimeout(promise, ms) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve(null), ms);
+      })
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+function emitProgress(ctx2) {
+  ctx2.emitter.emit("progress", {
+    pathsSeen: ctx2.pathsSeen,
+    bytesSoFar: ctx2.bytesSoFar
+  });
+}
+var CancelledError = class extends Error {
+  constructor() {
+    super("cancelled");
+    this.name = "CancelledError";
+  }
+};
+async function walk(dirPath, depth, ctx2) {
+  if (ctx2.cancelled.value) throw new CancelledError();
+  const baseName = import_path8.default.basename(dirPath) || dirPath;
+  if (depth > 0 && shouldSkip(dirPath, baseName)) {
+    return { name: baseName, path: dirPath, size: 0, isDir: true };
+  }
+  ctx2.pathsSeen += 1;
+  if (ctx2.pathsSeen % PROGRESS_EVERY_PATHS === 0) emitProgress(ctx2);
+  let filesBytes = 0;
+  const subdirPaths = [];
+  await ctx2.sem.acquire();
+  try {
+    const dir = await withTimeout((0, import_promises6.opendir)(dirPath), FS_TIMEOUT_MS);
+    if (!dir) {
+      return { name: baseName, path: dirPath, size: 0, isDir: true };
+    }
+    try {
+      for await (const entry of dir) {
+        if (ctx2.cancelled.value) break;
+        if (entry.isSymbolicLink()) continue;
+        const full = import_path8.default.join(dirPath, entry.name);
+        if (shouldSkip(full, entry.name)) continue;
+        if (entry.isDirectory()) {
+          subdirPaths.push(full);
+        } else if (entry.isFile()) {
+          const stats = await withTimeout((0, import_promises6.lstat)(full), FS_TIMEOUT_MS);
+          if (stats) {
+            filesBytes += stats.size;
+            ctx2.bytesSoFar += stats.size;
+          }
+        }
+      }
+    } catch {
+    }
+  } catch {
+  } finally {
+    ctx2.sem.release();
+  }
+  if (ctx2.cancelled.value) throw new CancelledError();
+  const children2 = await Promise.all(
+    subdirPaths.map((p) => walk(p, depth + 1, ctx2))
+  );
+  const subSize = children2.reduce((sum, child) => sum + child.size, 0);
+  const totalSize = filesBytes + subSize;
+  if (depth >= KEEP_DEPTH) {
+    return { name: baseName, path: dirPath, size: totalSize, isDir: true };
+  }
+  const kept = children2.filter((child) => child.size > 0);
+  if (filesBytes > 0) {
+    kept.push({
+      name: "(files)",
+      path: `${dirPath}/.files`,
+      size: filesBytes,
+      isDir: false
+    });
+  }
+  kept.sort((a, b) => b.size - a.size);
+  return {
+    name: baseName,
+    path: dirPath,
+    size: totalSize,
+    isDir: true,
+    children: kept
+  };
+}
+var DiskScanner = class extends import_events3.EventEmitter {
+  currentCancel = null;
+  isScanning() {
+    return this.currentCancel !== null;
+  }
+  cancel() {
+    if (this.currentCancel) this.currentCancel.value = true;
+    this.currentCancel = null;
+  }
+  resolveRoot(requested) {
+    if (!requested || requested === "/") {
+      if ((0, import_fs5.existsSync)("/System/Volumes/Data")) return "/System/Volumes/Data";
+    }
+    return requested;
+  }
+  async scan(rootPath) {
+    this.cancel();
+    const resolvedRoot = this.resolveRoot(rootPath);
+    const cancelled = { value: false };
+    this.currentCancel = cancelled;
+    const ctx2 = {
+      sem: new Semaphore(MAX_CONCURRENT_FS),
+      cancelled,
+      pathsSeen: 0,
+      bytesSoFar: 0,
+      emitter: this
+    };
+    try {
+      const tree = await walk(resolvedRoot, 0, ctx2);
+      emitProgress(ctx2);
+      return tree;
+    } catch (err) {
+      if (err instanceof CancelledError) return null;
+      throw err;
+    } finally {
+      if (this.currentCancel === cancelled) this.currentCancel = null;
+    }
+  }
+};
+
+// src/plugin/manager.js
+var plugins = [];
+var ctx = null;
+var started = /* @__PURE__ */ new Set();
+function initPluginManager(initial, context) {
+  plugins = [...initial];
+  ctx = context;
+  for (const plugin of plugins) {
+    plugin.setup(ctx);
+  }
+}
+function applyEnabled(disabled) {
+  const off = new Set(disabled);
+  for (const plugin of plugins) {
+    const enabled = !off.has(plugin.id);
+    if (enabled && !started.has(plugin.id)) {
+      started.add(plugin.id);
+      plugin.start?.();
+    } else if (!enabled && started.has(plugin.id)) {
+      started.delete(plugin.id);
+      plugin.dispose?.();
+    }
+  }
+}
+async function disposeAllPlugins() {
+  for (const plugin of plugins) {
+    if (started.has(plugin.id)) {
+      started.delete(plugin.id);
+      await plugin.dispose?.();
+    }
+  }
+}
+function registerPlugin(plugin) {
+  plugins.push(plugin);
+  plugin.setup(ctx);
+}
+async function unregisterPlugin(id) {
+  const idx = plugins.findIndex((plugin) => plugin.id === id);
+  if (idx === -1) return;
+  if (started.has(id)) {
+    started.delete(id);
+    await plugins[idx].dispose?.();
+  }
+  plugins.splice(idx, 1);
+}
+
+// src/features/bluetooth/bluetooth-manager.ts
+var import_child_process5 = require("child_process");
+var import_fs6 = require("fs");
+var import_path10 = __toESM(require("path"), 1);
+var import_util4 = require("util");
+var import_url2 = require("url");
+var import_events4 = require("events");
 
 // node_modules/.pnpm/plist@5.0.0/node_modules/plist/dist/parse.js
 var import_xmldom = __toESM(require_lib(), 1);
@@ -11015,28 +13321,29 @@ function parsePlistXML(node) {
 var import_xmlbuilder = __toESM(require_lib2(), 1);
 
 // src/electron/paths.ts
-var import_electron = require("electron");
-var import_path = __toESM(require("path"), 1);
+var import_electron4 = require("electron");
+var import_path9 = __toESM(require("path"), 1);
 var import_url = require("url");
-var __dirname = import_path.default.dirname((0, import_url.fileURLToPath)(__cjs_meta_url));
-function helperSourceDir() {
-  return import_electron.app.isPackaged ? import_path.default.join(process.resourcesPath, "swift") : __dirname;
+var __dirname = import_path9.default.dirname((0, import_url.fileURLToPath)(__cjs_meta_url));
+function helperSourceDir(devDir) {
+  return import_electron4.app.isPackaged ? import_path9.default.join(process.resourcesPath, "swift") : devDir ?? __dirname;
 }
 function helperCacheDir() {
-  return import_path.default.join(import_electron.app.getPath("userData"), "swift-helpers");
+  return import_path9.default.join(import_electron4.app.getPath("userData"), "swift-helpers");
 }
 
-// src/electron/bluetooth-manager.ts
-var execPromise = (0, import_util.promisify)(import_child_process.exec);
-var execFilePromise = (0, import_util.promisify)(import_child_process.execFile);
+// src/features/bluetooth/bluetooth-manager.ts
+var execPromise = (0, import_util4.promisify)(import_child_process5.exec);
+var execFilePromise = (0, import_util4.promisify)(import_child_process5.execFile);
 var bluetoothDebugEnabled = process.env.BLUETOOTH_DEBUG === "1";
+var featureDir = import_path10.default.dirname((0, import_url2.fileURLToPath)(__cjs_meta_url));
 async function getSwiftHelper(scriptName) {
   const cacheDir = helperCacheDir();
-  const sourcePath = import_path2.default.join(helperSourceDir(), scriptName);
-  const outputPath = import_path2.default.join(cacheDir, scriptName.replace(/\.swift$/, ""));
-  const needsBuild = !(0, import_fs.existsSync)(outputPath) || (0, import_fs.statSync)(outputPath).mtimeMs < (0, import_fs.statSync)(sourcePath).mtimeMs;
+  const sourcePath = import_path10.default.join(helperSourceDir(featureDir), scriptName);
+  const outputPath = import_path10.default.join(cacheDir, scriptName.replace(/\.swift$/, ""));
+  const needsBuild = !(0, import_fs6.existsSync)(outputPath) || (0, import_fs6.statSync)(outputPath).mtimeMs < (0, import_fs6.statSync)(sourcePath).mtimeMs;
   if (needsBuild) {
-    (0, import_fs.mkdirSync)(cacheDir, { recursive: true });
+    (0, import_fs6.mkdirSync)(cacheDir, { recursive: true });
     await execFilePromise("xcrun", ["swiftc", sourcePath, "-o", outputPath], { timeout: 3e4 });
   }
   return outputPath;
@@ -11073,7 +13380,7 @@ function parseBatteryLevel(value) {
   return match ? Number.parseInt(match[1], 10) : null;
 }
 var BLE_REFRESH_INTERVAL_MS = 3e4;
-var BluetoothManager = class extends import_events.EventEmitter {
+var BluetoothManager = class extends import_events4.EventEmitter {
   devices = /* @__PURE__ */ new Map();
   monitoringInterval = null;
   isMonitoring = false;
@@ -11479,12 +13786,410 @@ var BluetoothManager = class extends import_events.EventEmitter {
   }
 };
 
-// src/electron/media-manager.ts
-var import_child_process2 = require("child_process");
-var import_fs2 = require("fs");
-var import_path3 = __toESM(require("path"), 1);
-var import_util2 = require("util");
-var execFilePromise2 = (0, import_util2.promisify)(import_child_process2.execFile);
+// src/features/bluetooth/main.ts
+function createBluetoothPlugin() {
+  let manager = null;
+  let ctx2;
+  async function whenReady() {
+    if (manager) return manager;
+    for (let i = 0; i < 50; i += 1) {
+      if (manager) return manager;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    return null;
+  }
+  return {
+    id: "bluetooth",
+    setup(context) {
+      ctx2 = context;
+      const { ipcMain: ipcMain2 } = ctx2;
+      ipcMain2.handle("bluetooth:get-devices", async () => {
+        const mgr = await whenReady();
+        if (!mgr) return { connected: [], notConnected: [], timestamp: Date.now() };
+        return await mgr.getDevices();
+      });
+      ipcMain2.handle("bluetooth:connect-device", async (_event, address) => {
+        const mgr = await whenReady();
+        if (!mgr) return { success: false, error: "Bluetooth not ready" };
+        return await mgr.connectDevice(address);
+      });
+      ipcMain2.handle("bluetooth:disconnect-device", async (_event, address) => {
+        const mgr = await whenReady();
+        if (!mgr) return { success: false, error: "Bluetooth not ready" };
+        return await mgr.disconnectDevice(address);
+      });
+      ipcMain2.handle("bluetooth:forget-device", async (_event, address) => {
+        const mgr = await whenReady();
+        if (!mgr) return { success: false, error: "Bluetooth not ready" };
+        return await mgr.forgetDevice(address);
+      });
+      ipcMain2.handle("bluetooth:scan-devices", async (_event, duration = 5) => {
+        const mgr = await whenReady();
+        if (!mgr) return { success: false, error: "Bluetooth not ready" };
+        return await mgr.scanForDevices(duration);
+      });
+      ipcMain2.handle("bluetooth:get-battery", async (_event, address) => {
+        const mgr = await whenReady();
+        if (!mgr) return null;
+        return await mgr.getBatteryLevel(address);
+      });
+    },
+    async start() {
+      manager = new BluetoothManager();
+      manager.on("devices-updated", (devices) => ctx2.broadcast("bluetooth:devices-updated", devices));
+      manager.on("connection-changed", (data) => ctx2.broadcast("bluetooth:connection-changed", data));
+      manager.on("battery-updated", (data) => ctx2.broadcast("bluetooth:battery-updated", data));
+      manager.on("error", (error) => ctx2.broadcast("bluetooth:error", error));
+      manager.on("scan-started", () => ctx2.broadcast("bluetooth:scan-started"));
+      manager.on("scan-completed", () => ctx2.broadcast("bluetooth:scan-completed"));
+      await manager.startMonitoring();
+    },
+    dispose() {
+      manager?.stopMonitoring();
+    }
+  };
+}
+
+// src/features/docker/docker-manager.ts
+var import_events5 = require("events");
+var import_child_process6 = require("child_process");
+var import_util5 = require("util");
+var import_crypto4 = require("crypto");
+var import_node_pty2 = require("node-pty");
+var execFileP = (0, import_util5.promisify)(import_child_process6.execFile);
+var RUN_TIMEOUT = 3e4;
+var PRUNE_TIMEOUT = 12e4;
+var parseJsonLines = (stdout, map) => {
+  return stdout.split("\n").filter((line) => line.trim().length > 0).map((line) => {
+    try {
+      return map(JSON.parse(line));
+    } catch {
+      return null;
+    }
+  }).filter((value) => value !== null);
+};
+var DockerManager = class extends import_events5.EventEmitter {
+  execSessions = /* @__PURE__ */ new Map();
+  async isAvailable() {
+    try {
+      const { stdout } = await execFileP(
+        "docker",
+        ["version", "--format", "{{.Server.Version}}"],
+        { timeout: 4e3 }
+      );
+      const version = stdout.trim();
+      if (!version) {
+        return { available: false, error: "Docker daemon not responding" };
+      }
+      return { available: true, version };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return { available: false, error: message };
+    }
+  }
+  async listContainers() {
+    const { stdout } = await execFileP(
+      "docker",
+      ["container", "ls", "-a", "--format", "{{json .}}"],
+      { timeout: RUN_TIMEOUT, maxBuffer: 4 * 1024 * 1024 }
+    );
+    return parseJsonLines(stdout, (raw) => ({
+      id: raw.ID ?? "",
+      name: raw.Names ?? "",
+      image: raw.Image ?? "",
+      state: (raw.State ?? "").toLowerCase(),
+      status: raw.Status ?? "",
+      ports: raw.Ports ?? "",
+      command: raw.Command ?? "",
+      createdAt: raw.CreatedAt ?? "",
+      size: raw.Size ?? ""
+    }));
+  }
+  async listImages() {
+    const { stdout } = await execFileP(
+      "docker",
+      ["image", "ls", "--format", "{{json .}}"],
+      { timeout: RUN_TIMEOUT, maxBuffer: 4 * 1024 * 1024 }
+    );
+    return parseJsonLines(stdout, (raw) => ({
+      id: raw.ID ?? "",
+      repository: raw.Repository ?? "",
+      tag: raw.Tag ?? "",
+      size: raw.Size ?? "",
+      createdSince: raw.CreatedSince ?? ""
+    }));
+  }
+  async listVolumes() {
+    const { stdout } = await execFileP(
+      "docker",
+      ["volume", "ls", "--format", "{{json .}}"],
+      { timeout: RUN_TIMEOUT, maxBuffer: 2 * 1024 * 1024 }
+    );
+    return parseJsonLines(stdout, (raw) => ({
+      name: raw.Name ?? "",
+      driver: raw.Driver ?? "",
+      mountpoint: raw.Mountpoint ?? "",
+      scope: raw.Scope ?? ""
+    }));
+  }
+  async listNetworks() {
+    const { stdout } = await execFileP(
+      "docker",
+      ["network", "ls", "--format", "{{json .}}"],
+      { timeout: RUN_TIMEOUT, maxBuffer: 2 * 1024 * 1024 }
+    );
+    return parseJsonLines(stdout, (raw) => ({
+      id: raw.ID ?? "",
+      name: raw.Name ?? "",
+      driver: raw.Driver ?? "",
+      scope: raw.Scope ?? ""
+    }));
+  }
+  async runImage(options) {
+    const args = ["run"];
+    const detached = options.detached !== false;
+    if (detached) args.push("-d");
+    if (options.autoRemove) args.push("--rm");
+    if (options.name && options.name.trim()) {
+      args.push("--name", options.name.trim());
+    }
+    for (const port of options.ports ?? []) {
+      const host = port.host.trim();
+      const container = port.container.trim();
+      if (!host || !container) continue;
+      args.push("-p", `${host}:${container}`);
+    }
+    for (const env of options.env ?? []) {
+      const key = env.key.trim();
+      if (!key) continue;
+      args.push("-e", `${key}=${env.value}`);
+    }
+    for (const volume of options.volumes ?? []) {
+      const host = volume.host.trim();
+      const container = volume.container.trim();
+      if (!host || !container) continue;
+      args.push("-v", `${host}:${container}`);
+    }
+    args.push(options.image);
+    if (options.command && options.command.trim()) {
+      const tokens = options.command.trim().split(/\s+/);
+      args.push(...tokens);
+    }
+    const { stdout } = await execFileP("docker", args, { timeout: RUN_TIMEOUT });
+    return { containerId: stdout.trim() };
+  }
+  async startContainer(id) {
+    await execFileP("docker", ["start", id], { timeout: RUN_TIMEOUT });
+  }
+  async stopContainer(id) {
+    await execFileP("docker", ["stop", id], { timeout: RUN_TIMEOUT });
+  }
+  async restartContainer(id) {
+    await execFileP("docker", ["restart", id], { timeout: RUN_TIMEOUT });
+  }
+  async removeContainer(id, force = false) {
+    const args = ["rm", ...force ? ["-f"] : [], id];
+    await execFileP("docker", args, { timeout: RUN_TIMEOUT });
+  }
+  async removeImage(id, force = false) {
+    const args = ["rmi", ...force ? ["-f"] : [], id];
+    await execFileP("docker", args, { timeout: RUN_TIMEOUT });
+  }
+  async removeVolume(name, force = false) {
+    const args = ["volume", "rm", ...force ? ["-f"] : [], name];
+    await execFileP("docker", args, { timeout: RUN_TIMEOUT });
+  }
+  async removeNetwork(name) {
+    await execFileP("docker", ["network", "rm", name], { timeout: RUN_TIMEOUT });
+  }
+  async pruneContainers() {
+    const { stdout } = await execFileP("docker", ["container", "prune", "-f"], { timeout: PRUNE_TIMEOUT });
+    return stdout;
+  }
+  async pruneImages(all = false) {
+    const args = ["image", "prune", "-f", ...all ? ["-a"] : []];
+    const { stdout } = await execFileP("docker", args, { timeout: PRUNE_TIMEOUT });
+    return stdout;
+  }
+  async pruneVolumes() {
+    const { stdout } = await execFileP("docker", ["volume", "prune", "-f"], { timeout: PRUNE_TIMEOUT });
+    return stdout;
+  }
+  async pruneNetworks() {
+    const { stdout } = await execFileP("docker", ["network", "prune", "-f"], { timeout: PRUNE_TIMEOUT });
+    return stdout;
+  }
+  async pruneSystem(all = false) {
+    const args = ["system", "prune", "-f", ...all ? ["-a"] : []];
+    const { stdout } = await execFileP("docker", args, { timeout: PRUNE_TIMEOUT });
+    return stdout;
+  }
+  async getLogs(containerId, tail = 500) {
+    const { stdout, stderr } = await execFileP(
+      "docker",
+      ["logs", "--tail", String(tail), "--timestamps", containerId],
+      { timeout: 15e3, maxBuffer: 16 * 1024 * 1024 }
+    );
+    return stdout + stderr;
+  }
+  startExec(containerId, containerName, cols = 120, rows = 30) {
+    const id = (0, import_crypto4.randomUUID)();
+    const shellCmd = "[ -x /bin/bash ] && exec /bin/bash || exec /bin/sh";
+    const pty = (0, import_node_pty2.spawn)(
+      "docker",
+      ["exec", "-it", containerId, "/bin/sh", "-c", shellCmd],
+      {
+        name: "xterm-256color",
+        cols,
+        rows,
+        cwd: process.cwd(),
+        env: process.env
+      }
+    );
+    this.execSessions.set(id, { id, pty, containerId, containerName });
+    pty.onData((data) => this.emit("exec-data", { sessionId: id, data }));
+    pty.onExit(({ exitCode, signal }) => {
+      this.execSessions.delete(id);
+      this.emit("exec-exit", { sessionId: id, exitCode, signal });
+    });
+    return { sessionId: id };
+  }
+  writeExec(sessionId, data) {
+    const session = this.execSessions.get(sessionId);
+    if (!session) return false;
+    session.pty.write(data);
+    return true;
+  }
+  resizeExec(sessionId, cols, rows) {
+    const session = this.execSessions.get(sessionId);
+    if (!session) return false;
+    try {
+      session.pty.resize(Math.max(cols, 1), Math.max(rows, 1));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  closeExec(sessionId) {
+    const session = this.execSessions.get(sessionId);
+    if (!session) return false;
+    try {
+      session.pty.kill();
+    } catch {
+    }
+    this.execSessions.delete(sessionId);
+    return true;
+  }
+  ownsExec(sessionId) {
+    return this.execSessions.has(sessionId);
+  }
+  dispose() {
+    for (const session of this.execSessions.values()) {
+      try {
+        session.pty.kill();
+      } catch {
+      }
+    }
+    this.execSessions.clear();
+  }
+};
+
+// src/plugin/terminal-router.ts
+var backends = [];
+function registerTerminalBackend(backend) {
+  backends.push(backend);
+  return () => {
+    const i = backends.indexOf(backend);
+    if (i >= 0) backends.splice(i, 1);
+  };
+}
+function isRouted(sessionId) {
+  return backends.some((backend) => backend.owns(sessionId));
+}
+function routeTerminal(action, sessionId, ...args) {
+  const backend = backends.find((b) => b.owns(sessionId));
+  if (!backend) return void 0;
+  const fn = backend[action];
+  return fn(sessionId, ...args);
+}
+
+// src/features/docker/main.ts
+function createDockerPlugin() {
+  const docker = new DockerManager();
+  return {
+    id: "docker",
+    setup(ctx2) {
+      const { ipcMain: ipcMain2 } = ctx2;
+      docker.on("exec-data", (payload) => ctx2.broadcast("ssh:session-data", payload));
+      docker.on("exec-exit", (payload) => ctx2.broadcast("ssh:session-exit", payload));
+      registerTerminalBackend({
+        owns: (id) => docker.ownsExec(id),
+        write: (id, data) => docker.writeExec(id, data),
+        resize: (id, cols, rows) => docker.resizeExec(id, cols, rows),
+        close: (id) => docker.closeExec(id)
+      });
+      ipcMain2.handle("docker:status", async () => docker.isAvailable());
+      ipcMain2.handle("docker:list-containers", async () => docker.listContainers());
+      ipcMain2.handle("docker:list-images", async () => docker.listImages());
+      ipcMain2.handle("docker:list-volumes", async () => docker.listVolumes());
+      ipcMain2.handle("docker:list-networks", async () => docker.listNetworks());
+      ipcMain2.handle("docker:run-image", async (_event, options) => docker.runImage(options));
+      ipcMain2.handle("docker:start-container", async (_event, id) => {
+        await docker.startContainer(id);
+        return true;
+      });
+      ipcMain2.handle("docker:stop-container", async (_event, id) => {
+        await docker.stopContainer(id);
+        return true;
+      });
+      ipcMain2.handle("docker:restart-container", async (_event, id) => {
+        await docker.restartContainer(id);
+        return true;
+      });
+      ipcMain2.handle("docker:remove-container", async (_event, id, force) => {
+        await docker.removeContainer(id, Boolean(force));
+        return true;
+      });
+      ipcMain2.handle("docker:remove-image", async (_event, id, force) => {
+        await docker.removeImage(id, Boolean(force));
+        return true;
+      });
+      ipcMain2.handle("docker:remove-volume", async (_event, name, force) => {
+        await docker.removeVolume(name, Boolean(force));
+        return true;
+      });
+      ipcMain2.handle("docker:remove-network", async (_event, name) => {
+        await docker.removeNetwork(name);
+        return true;
+      });
+      ipcMain2.handle("docker:prune-containers", async () => docker.pruneContainers());
+      ipcMain2.handle("docker:prune-images", async (_event, all) => docker.pruneImages(Boolean(all)));
+      ipcMain2.handle("docker:prune-volumes", async () => docker.pruneVolumes());
+      ipcMain2.handle("docker:prune-networks", async () => docker.pruneNetworks());
+      ipcMain2.handle("docker:prune-system", async (_event, all) => docker.pruneSystem(Boolean(all)));
+      ipcMain2.handle(
+        "docker:logs",
+        async (_event, id, tail) => docker.getLogs(id, typeof tail === "number" ? tail : 500)
+      );
+      ipcMain2.handle(
+        "docker:exec-start",
+        async (_event, containerId, containerName, cols, rows) => docker.startExec(containerId, containerName, cols, rows)
+      );
+    },
+    dispose() {
+      docker.dispose();
+    }
+  };
+}
+
+// src/features/media/media-manager.ts
+var import_child_process7 = require("child_process");
+var import_fs7 = require("fs");
+var import_path11 = __toESM(require("path"), 1);
+var import_util6 = require("util");
+var import_url3 = require("url");
+var execFilePromise2 = (0, import_util6.promisify)(import_child_process7.execFile);
+var featureDir2 = import_path11.default.dirname((0, import_url3.fileURLToPath)(__cjs_meta_url));
 var ALLOWED_BUNDLE_IDS = /* @__PURE__ */ new Set([
   "com.spotify.client",
   // Spotify
@@ -11544,11 +14249,11 @@ async function runAppleScript(script) {
 }
 async function getSwiftHelper2(scriptName) {
   const cacheDir = helperCacheDir();
-  const sourcePath = import_path3.default.join(helperSourceDir(), scriptName);
-  const outputPath = import_path3.default.join(cacheDir, scriptName.replace(/\.swift$/, ""));
-  const needsBuild = !(0, import_fs2.existsSync)(outputPath) || (0, import_fs2.statSync)(outputPath).mtimeMs < (0, import_fs2.statSync)(sourcePath).mtimeMs;
+  const sourcePath = import_path11.default.join(helperSourceDir(featureDir2), scriptName);
+  const outputPath = import_path11.default.join(cacheDir, scriptName.replace(/\.swift$/, ""));
+  const needsBuild = !(0, import_fs7.existsSync)(outputPath) || (0, import_fs7.statSync)(outputPath).mtimeMs < (0, import_fs7.statSync)(sourcePath).mtimeMs;
   if (needsBuild) {
-    (0, import_fs2.mkdirSync)(cacheDir, { recursive: true });
+    (0, import_fs7.mkdirSync)(cacheDir, { recursive: true });
     await execFilePromise2("xcrun", ["swiftc", sourcePath, "-o", outputPath], { timeout: 15e3 });
   }
   return outputPath;
@@ -11652,7 +14357,7 @@ var APPLESCRIPT_CONTROLLERS = {
 var MediaManager = class {
   async getAllNowPlaying() {
     try {
-      const swiftPath = import_path3.default.join(helperSourceDir(), "now-playing.swift");
+      const swiftPath = import_path11.default.join(helperSourceDir(featureDir2), "now-playing.swift");
       const { stdout } = await execFilePromise2("swift", [swiftPath], { timeout: 7e3 });
       const entries = JSON.parse(stdout.toString());
       const tracks = entries.map(normalizeMediaRemoteEntry).filter((track) => isAllowedSource(track.bundleId));
@@ -11686,1623 +14391,7 @@ var MediaManager = class {
   }
 };
 
-// src/electron/system-monitor.ts
-var import_child_process3 = require("child_process");
-var import_fs3 = require("fs");
-var import_os = __toESM(require("os"), 1);
-var import_util3 = require("util");
-var execFileAsync = (0, import_util3.promisify)(import_child_process3.execFile);
-var POSIX_ENV = { ...process.env, LC_NUMERIC: "C", LC_CTYPE: "en_US.UTF-8" };
-function extractAppPath(command) {
-  const match = command.match(/^(.*?\.app)\//);
-  return match ? match[1] : null;
-}
-function appNameFromPath(appPath) {
-  const tail = appPath.split("/").filter(Boolean).pop() ?? appPath;
-  return tail.replace(/\.app$/, "");
-}
-var toNumber = (value) => {
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : 0;
-};
-var getCpuSnapshot = () => {
-  return import_os.default.cpus().reduce(
-    (snapshot, cpu) => {
-      const total = Object.values(cpu.times).reduce((sum, value) => sum + value, 0);
-      return {
-        idle: snapshot.idle + cpu.times.idle,
-        total: snapshot.total + total
-      };
-    },
-    { idle: 0, total: 0 }
-  );
-};
-var SystemMonitor = class {
-  previousCpu = getCpuSnapshot();
-  previousNetwork = null;
-  projectRoot = (() => {
-    const exe = process.execPath;
-    const appMatch = exe.match(/^(.*?\.app)\//);
-    if (appMatch) {
-      return appMatch[1];
-    }
-    return process.cwd();
-  })();
-  appName = this.projectRoot.split("/").filter(Boolean).pop()?.replace(/\.app$/, "") ?? "app";
-  async getMetrics() {
-    const [disk, network, project] = await Promise.all([
-      this.getDiskMetrics(),
-      this.getNetworkMetrics(),
-      this.getProjectMetrics()
-    ]);
-    return {
-      timestamp: Date.now(),
-      cpu: this.getCpuMetrics(),
-      memory: this.getMemoryMetrics(),
-      disk,
-      network,
-      project
-    };
-  }
-  getCpuMetrics() {
-    const current = getCpuSnapshot();
-    const idleDelta = current.idle - this.previousCpu.idle;
-    const totalDelta = current.total - this.previousCpu.total;
-    this.previousCpu = current;
-    const percent = totalDelta > 0 ? (totalDelta - idleDelta) / totalDelta * 100 : 0;
-    return {
-      percent: Math.min(Math.max(percent, 0), 100),
-      cores: import_os.default.cpus().length,
-      loadAverage: import_os.default.loadavg()
-    };
-  }
-  getMemoryMetrics() {
-    const totalBytes = import_os.default.totalmem();
-    const freeBytes = import_os.default.freemem();
-    const usedBytes = totalBytes - freeBytes;
-    return {
-      totalBytes,
-      usedBytes,
-      freeBytes,
-      percent: totalBytes > 0 ? usedBytes / totalBytes * 100 : 0
-    };
-  }
-  async getDiskMetrics() {
-    const target = (0, import_fs3.existsSync)("/System/Volumes/Data") ? "/System/Volumes/Data" : "/";
-    try {
-      const { stdout } = await execFileAsync("df", ["-k", target], { env: POSIX_ENV });
-      const line = stdout.trim().split("\n")[1];
-      const parts = line?.trim().split(/\s+/) ?? [];
-      const totalBytes = toNumber(parts[1]) * 1024;
-      const usedBytes = toNumber(parts[2]) * 1024;
-      const freeBytes = toNumber(parts[3]) * 1024;
-      return {
-        mount: "/",
-        totalBytes,
-        usedBytes,
-        freeBytes,
-        percent: totalBytes > 0 ? usedBytes / totalBytes * 100 : 0
-      };
-    } catch (error) {
-      console.error("[SystemMonitor] df failed:", error);
-      return {
-        mount: "/",
-        totalBytes: 0,
-        usedBytes: 0,
-        freeBytes: 0,
-        percent: 0
-      };
-    }
-  }
-  async getNetworkMetrics() {
-    const current = await this.readNetworkTotals();
-    const previous = this.previousNetwork;
-    this.previousNetwork = current;
-    if (!previous) {
-      return {
-        rxBytes: current.rxBytes,
-        txBytes: current.txBytes,
-        rxBytesPerSecond: 0,
-        txBytesPerSecond: 0
-      };
-    }
-    const elapsedSeconds = Math.max((current.timestamp - previous.timestamp) / 1e3, 1);
-    return {
-      rxBytes: current.rxBytes,
-      txBytes: current.txBytes,
-      rxBytesPerSecond: Math.max((current.rxBytes - previous.rxBytes) / elapsedSeconds, 0),
-      txBytesPerSecond: Math.max((current.txBytes - previous.txBytes) / elapsedSeconds, 0)
-    };
-  }
-  async readNetworkTotals() {
-    try {
-      const { stdout } = await execFileAsync("netstat", ["-ibn"], { env: POSIX_ENV });
-      const totals = stdout.trim().split("\n").slice(1).reduce(
-        (sum, line) => {
-          const parts = line.trim().split(/\s+/);
-          const name = parts[0] ?? "";
-          const network = parts[2] ?? "";
-          if (!network.startsWith("<Link#") || name === "lo0" || name.endsWith("*")) {
-            return sum;
-          }
-          return {
-            rxBytes: sum.rxBytes + toNumber(parts[6]),
-            txBytes: sum.txBytes + toNumber(parts[9])
-          };
-        },
-        { rxBytes: 0, txBytes: 0 }
-      );
-      return {
-        ...totals,
-        timestamp: Date.now()
-      };
-    } catch (error) {
-      console.error("[SystemMonitor] netstat failed:", error);
-      return {
-        rxBytes: 0,
-        txBytes: 0,
-        timestamp: Date.now()
-      };
-    }
-  }
-  async getProjectMetrics() {
-    const processes = await this.getProcessList();
-    const childrenByParent = /* @__PURE__ */ new Map();
-    for (const item of processes) {
-      const children2 = childrenByParent.get(item.ppid) ?? [];
-      children2.push(item);
-      childrenByParent.set(item.ppid, children2);
-    }
-    const projectProcesses = [];
-    const seen = /* @__PURE__ */ new Set();
-    const visit = (pid) => {
-      if (seen.has(pid)) {
-        return;
-      }
-      seen.add(pid);
-      const processInfo = processes.find((item) => item.pid === pid);
-      if (processInfo) {
-        projectProcesses.push(processInfo);
-      }
-      for (const child of childrenByParent.get(pid) ?? []) {
-        visit(child.pid);
-      }
-    };
-    visit(process.pid);
-    for (const item of processes) {
-      if (this.isProjectProcess(item)) {
-        visit(item.pid);
-      }
-    }
-    const measuredProcesses = projectProcesses.filter((item) => !this.isCollectorProcess(item)).filter((item, index, source) => source.findIndex((match) => match.pid === item.pid) === index);
-    const cpuPercent = measuredProcesses.reduce((sum, item) => sum + item.cpuPercent, 0);
-    const memoryBytes = measuredProcesses.reduce((sum, item) => sum + item.memoryBytes, 0);
-    const totalMemory = import_os.default.totalmem();
-    return {
-      pid: process.pid,
-      processCount: measuredProcesses.length,
-      cpuPercent,
-      memoryPercent: totalMemory > 0 ? memoryBytes / totalMemory * 100 : 0,
-      memoryBytes,
-      processes: measuredProcesses.sort((left, right) => right.memoryBytes - left.memoryBytes).slice(0, 8).map((item) => ({
-        pid: item.pid,
-        cpuPercent: item.cpuPercent,
-        memoryBytes: item.memoryBytes,
-        name: item.name,
-        role: item.role
-      }))
-    };
-  }
-  isProjectProcess(item) {
-    const processText = item.command.toLowerCase();
-    const root = this.projectRoot.toLowerCase();
-    const appSupportPath = `/application support/${this.appName.toLowerCase()}`;
-    const projectToolPaths = [
-      `${root}/node_modules/.pnpm/electron`,
-      `${root}/node_modules/.bin/electron`,
-      `${root}/node_modules/.pnpm/vite`,
-      `${root}/node_modules/.bin/vite`
-    ];
-    const isPackaged = root.endsWith(".app");
-    return item.pid === process.pid || isPackaged && processText.includes(root) || processText.includes(`--app-path=${root}`) || processText.includes(appSupportPath) || projectToolPaths.some((toolPath) => processText.includes(toolPath));
-  }
-  isCollectorProcess(item) {
-    const processText = `${item.name} ${item.command}`.toLowerCase();
-    return item.ppid === process.pid && (processText.includes("ps -axo pid,ppid,%cpu,rss,comm,args") || processText.includes("netstat") || processText.includes("df -k /"));
-  }
-  async getProcessList() {
-    try {
-      const { stdout } = await execFileAsync("ps", ["-axo", "pid,ppid,user,%cpu,rss,comm,args"], { env: POSIX_ENV });
-      const lines = stdout.trim().split("\n");
-      const parsed = lines.slice(1).map((line) => {
-        const match = line.match(/^\s*(\d+)\s+(\d+)\s+(\S+)\s+([\d.]+)\s+(\d+)\s+(\S+)\s+(.*)$/);
-        if (!match) {
-          return null;
-        }
-        const commandPath = match[6] ?? "";
-        const command = match[7] ?? commandPath;
-        const name = commandPath.split("/").filter(Boolean).pop() ?? command.split(/\s+/)[0] ?? "process";
-        return {
-          pid: toNumber(match[1]),
-          ppid: toNumber(match[2]),
-          user: match[3] ?? "",
-          cpuPercent: toNumber(match[4]),
-          memoryBytes: toNumber(match[5]) * 1024,
-          name,
-          command,
-          role: this.getProcessRole(name, command)
-        };
-      }).filter((item) => Boolean(item));
-      return parsed;
-    } catch (error) {
-      console.error("[SystemMonitor] ps failed:", error);
-      return [];
-    }
-  }
-  async listAllProcesses() {
-    const processes = await this.getProcessList();
-    const currentUser = import_os.default.userInfo().username;
-    return processes.map((item) => {
-      const appPath = extractAppPath(item.command);
-      return {
-        pid: item.pid,
-        ppid: item.ppid,
-        user: item.user,
-        isOwnUser: item.user === currentUser,
-        cpuPercent: item.cpuPercent,
-        memoryBytes: item.memoryBytes,
-        name: item.name,
-        command: item.command,
-        appPath,
-        appName: appPath ? appNameFromPath(appPath) : null
-      };
-    });
-  }
-  killProcess(pid, signal = "SIGTERM") {
-    if (!Number.isInteger(pid) || pid <= 1) {
-      return { success: false, error: "Invalid PID", code: "EINVAL" };
-    }
-    try {
-      process.kill(pid, signal);
-      return { success: true };
-    } catch (error) {
-      return {
-        success: false,
-        error: error?.message ?? String(error),
-        code: error?.code
-      };
-    }
-  }
-  getProcessRole(name, command) {
-    const processText = `${name} ${command}`.toLowerCase();
-    if (processText.includes("--type=renderer")) return "Renderer";
-    if (processText.includes("--type=gpu-process")) return "GPU";
-    if (processText.includes("networkservice")) return "Network";
-    if (processText.includes("vite")) return "Dev server";
-    if (processText.includes("electron/cli")) return "Electron CLI";
-    if (processText.includes("electron.app/contents/macos/electron")) return "Main";
-    if (processText.includes("node")) return "Node";
-    return "Helper";
-  }
-};
-
-// src/electron/ssh-config-parser.ts
-var import_promises = require("fs/promises");
-var import_os2 = __toESM(require("os"), 1);
-var import_path4 = __toESM(require("path"), 1);
-var CONFIG_PATH = import_path4.default.join(import_os2.default.homedir(), ".ssh", "config");
-var KNOWN_HOSTS_PATH = import_path4.default.join(import_os2.default.homedir(), ".ssh", "known_hosts");
-var expandHome = (value) => value.startsWith("~") ? import_path4.default.join(import_os2.default.homedir(), value.slice(1)) : value;
-var parseConfig = (text) => {
-  const blocks = [];
-  let current = null;
-  for (const rawLine of text.split("\n")) {
-    const line = rawLine.replace(/#.*$/, "").trim();
-    if (!line) continue;
-    const [keyword, ...rest] = line.split(/\s+/);
-    if (!keyword) continue;
-    const value = rest.join(" ");
-    const lowerKey = keyword.toLowerCase();
-    if (lowerKey === "host") {
-      current = { patterns: rest, options: /* @__PURE__ */ new Map() };
-      blocks.push(current);
-    } else if (current && value) {
-      current.options.set(lowerKey, value);
-    }
-  }
-  return blocks;
-};
-var isConcreteAlias = (alias) => !alias.includes("*") && !alias.includes("?") && !alias.startsWith("!");
-var blockToHosts = (block) => {
-  const hostname = block.options.get("hostname");
-  const user = block.options.get("user");
-  const portRaw = block.options.get("port");
-  const identityFile = block.options.get("identityfile");
-  const port = portRaw ? Number(portRaw) : void 0;
-  return block.patterns.filter(isConcreteAlias).map((alias) => ({
-    id: `config:${alias}`,
-    alias,
-    hostname: hostname ?? alias,
-    user,
-    port: Number.isFinite(port) ? port : void 0,
-    identityFile: identityFile ? expandHome(identityFile) : void 0,
-    source: "config"
-  }));
-};
-var parseKnownHostName = (rawName) => {
-  if (!rawName || rawName.startsWith("|")) return null;
-  if (rawName.includes("*") || rawName.includes("?")) return null;
-  const bracketMatch = rawName.match(/^\[([^\]]+)\]:(\d+)$/);
-  if (bracketMatch) {
-    return { hostname: bracketMatch[1], port: Number(bracketMatch[2]) };
-  }
-  return { hostname: rawName };
-};
-var parseKnownHosts = (text) => {
-  const seen = /* @__PURE__ */ new Set();
-  const result = [];
-  for (const rawLine of text.split("\n")) {
-    const line = rawLine.trim();
-    if (!line || line.startsWith("#") || line.startsWith("|")) continue;
-    const [hostField] = line.split(/\s+/);
-    if (!hostField) continue;
-    for (const candidate of hostField.split(",")) {
-      const parsed = parseKnownHostName(candidate);
-      if (!parsed) continue;
-      const key = parsed.port ? `${parsed.hostname}:${parsed.port}` : parsed.hostname;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      result.push({
-        id: `known:${key}`,
-        alias: key,
-        hostname: parsed.hostname,
-        port: parsed.port,
-        source: "known_hosts"
-      });
-    }
-  }
-  return result;
-};
-var safeRead = async (file) => {
-  try {
-    return await (0, import_promises.readFile)(file, "utf8");
-  } catch {
-    return null;
-  }
-};
-async function listFileBasedHosts() {
-  const [configText, knownHostsText] = await Promise.all([
-    safeRead(CONFIG_PATH),
-    safeRead(KNOWN_HOSTS_PATH)
-  ]);
-  const configHosts = configText ? parseConfig(configText).flatMap(blockToHosts) : [];
-  const knownHosts = knownHostsText ? parseKnownHosts(knownHostsText) : [];
-  const configHostnames = new Set(
-    configHosts.flatMap((host) => [host.alias.toLowerCase(), host.hostname.toLowerCase()])
-  );
-  const knownOnly = knownHosts.filter(
-    (host) => !configHostnames.has(host.hostname.toLowerCase()) && !configHostnames.has(host.alias.toLowerCase())
-  );
-  return [...configHosts, ...knownOnly];
-}
-
-// src/electron/db.ts
-var import_fs4 = require("fs");
-var import_promises2 = require("fs/promises");
-var import_module = require("module");
-var import_path5 = __toESM(require("path"), 1);
-var import_electron2 = require("electron");
-var import_sql = __toESM(require("sql.js"), 1);
-var DB_TABLE_GROUPS = {
-  sshHosts: ["saved_hosts", "host_overrides", "port_forwards"],
-  rdpHosts: ["rdp_hosts"],
-  mediaHistory: ["media_history"],
-  mediaStats: ["media_artist_stats", "media_track_stats"]
-};
-var require2 = (0, import_module.createRequire)(__cjs_meta_url);
-var DB_FILENAME = "ebala.db";
-var db = null;
-var dbPath = null;
-var persistQueue = Promise.resolve();
-var existingColumns = (database, table) => {
-  const stmt = database.prepare(`PRAGMA table_info(${table})`);
-  const names = /* @__PURE__ */ new Set();
-  try {
-    while (stmt.step()) {
-      const row = stmt.getAsObject();
-      if (row.name) names.add(row.name);
-    }
-  } finally {
-    stmt.free();
-  }
-  return names;
-};
-var addColumnIfMissing = (database, table, column, definition) => {
-  const columns = existingColumns(database, table);
-  if (!columns.has(column)) {
-    database.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
-  }
-};
-var runMigrations = (database) => {
-  database.exec(`
-        CREATE TABLE IF NOT EXISTS saved_hosts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            label TEXT NOT NULL,
-            hostname TEXT NOT NULL,
-            port INTEGER NOT NULL DEFAULT 22,
-            username TEXT NOT NULL,
-            auth_method TEXT NOT NULL DEFAULT 'password',
-            password_encrypted BLOB,
-            identity_file TEXT,
-            color TEXT,
-            created_at INTEGER NOT NULL,
-            updated_at INTEGER NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_saved_hosts_label ON saved_hosts (label);
-
-        CREATE TABLE IF NOT EXISTS host_overrides (
-            host_id TEXT PRIMARY KEY,
-            custom_alias TEXT,
-            color TEXT,
-            notes TEXT,
-            hidden INTEGER NOT NULL DEFAULT 0,
-            username TEXT,
-            password_encrypted BLOB,
-            auth_method TEXT,
-            created_at INTEGER NOT NULL,
-            updated_at INTEGER NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_host_overrides_hidden ON host_overrides (hidden);
-
-        CREATE TABLE IF NOT EXISTS port_forwards (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            host_id TEXT NOT NULL,
-            type TEXT NOT NULL CHECK (type IN ('local', 'remote')),
-            bind_address TEXT,
-            bind_port INTEGER NOT NULL,
-            target_host TEXT NOT NULL,
-            target_port INTEGER NOT NULL,
-            label TEXT,
-            enabled INTEGER NOT NULL DEFAULT 1,
-            created_at INTEGER NOT NULL,
-            updated_at INTEGER NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_port_forwards_host ON port_forwards (host_id);
-
-        CREATE TABLE IF NOT EXISTS media_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT,
-            artist TEXT,
-            album TEXT,
-            bundle_id TEXT,
-            app_name TEXT,
-            artwork_url TEXT,
-            artwork_data_url TEXT,
-            duration_seconds INTEGER,
-            listened_seconds INTEGER NOT NULL DEFAULT 0,
-            started_at INTEGER NOT NULL,
-            ended_at INTEGER
-        );
-        CREATE INDEX IF NOT EXISTS idx_media_history_started ON media_history (started_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_media_history_artist ON media_history (artist);
-
-        -- Cumulative per-artist totals \u2014 survive media_history purges.
-        CREATE TABLE IF NOT EXISTS media_artist_stats (
-            artist TEXT PRIMARY KEY,
-            total_seconds INTEGER NOT NULL DEFAULT 0,
-            total_plays INTEGER NOT NULL DEFAULT 0,
-            first_played_at INTEGER NOT NULL,
-            last_played_at INTEGER NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_media_artist_stats_total ON media_artist_stats (total_seconds DESC);
-
-        -- Cumulative per-track totals (keyed by artist + title) \u2014 also survive purges.
-        CREATE TABLE IF NOT EXISTS media_track_stats (
-            artist TEXT NOT NULL DEFAULT '',
-            title TEXT NOT NULL,
-            album TEXT,
-            artwork_url TEXT,
-            artwork_data_url TEXT,
-            total_seconds INTEGER NOT NULL DEFAULT 0,
-            total_plays INTEGER NOT NULL DEFAULT 0,
-            first_played_at INTEGER NOT NULL,
-            last_played_at INTEGER NOT NULL,
-            PRIMARY KEY (artist, title)
-        );
-        CREATE INDEX IF NOT EXISTS idx_media_track_stats_artist ON media_track_stats (artist, total_seconds DESC);
-        CREATE INDEX IF NOT EXISTS idx_media_track_stats_total ON media_track_stats (total_seconds DESC);
-
-        CREATE TABLE IF NOT EXISTS rdp_hosts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            label TEXT NOT NULL,
-            hostname TEXT NOT NULL,
-            port INTEGER NOT NULL DEFAULT 3389,
-            username TEXT NOT NULL,
-            password_encrypted BLOB,
-            domain TEXT,
-            color TEXT,
-            notes TEXT,
-            created_at INTEGER NOT NULL,
-            updated_at INTEGER NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_rdp_hosts_label ON rdp_hosts (label);
-    `);
-  addColumnIfMissing(database, "host_overrides", "username", "TEXT");
-  addColumnIfMissing(database, "host_overrides", "password_encrypted", "BLOB");
-  addColumnIfMissing(database, "host_overrides", "auth_method", "TEXT");
-  addColumnIfMissing(database, "rdp_hosts", "extra_args", "TEXT");
-  const hasArtistRows = (database.exec("SELECT 1 FROM media_artist_stats LIMIT 1")[0]?.values.length ?? 0) > 0;
-  const hasHistoryRows = (database.exec("SELECT 1 FROM media_history WHERE listened_seconds >= 5 LIMIT 1")[0]?.values.length ?? 0) > 0;
-  if (!hasArtistRows && hasHistoryRows) {
-    database.exec(`
-            INSERT INTO media_artist_stats (artist, total_seconds, total_plays, first_played_at, last_played_at)
-            SELECT artist, SUM(listened_seconds), COUNT(*), MIN(started_at), MAX(started_at)
-            FROM media_history
-            WHERE artist IS NOT NULL AND artist != '' AND listened_seconds >= 5
-            GROUP BY artist;
-
-            INSERT INTO media_track_stats (artist, title, album, artwork_url, artwork_data_url,
-                                           total_seconds, total_plays, first_played_at, last_played_at)
-            SELECT
-                COALESCE(artist, ''),
-                title,
-                MAX(album),
-                MAX(artwork_url),
-                MAX(artwork_data_url),
-                SUM(listened_seconds),
-                COUNT(*),
-                MIN(started_at),
-                MAX(started_at)
-            FROM media_history
-            WHERE title IS NOT NULL AND title != '' AND listened_seconds >= 5
-            GROUP BY COALESCE(artist, ''), title;
-        `);
-  }
-};
-async function openWithFallback(SQL, filePath) {
-  if (!(0, import_fs4.existsSync)(filePath)) return new SQL.Database();
-  const buffer = await (0, import_promises2.readFile)(filePath);
-  try {
-    const candidate = new SQL.Database(buffer);
-    candidate.exec("PRAGMA quick_check");
-    return candidate;
-  } catch (err) {
-    const stamp = (/* @__PURE__ */ new Date()).toISOString().replace(/[:.]/g, "-");
-    const quarantine = `${filePath}.corrupted-${stamp}`;
-    try {
-      await (0, import_promises2.rename)(filePath, quarantine);
-    } catch {
-    }
-    console.error(`[db] image malformed (${err?.message ?? err}); quarantined to ${quarantine}, starting fresh`);
-    return new SQL.Database();
-  }
-}
-async function initDb() {
-  if (db) return db;
-  const sqlJsDistPath = import_path5.default.dirname(require2.resolve("sql.js/dist/sql-wasm.js"));
-  const SQL = await (0, import_sql.default)({
-    locateFile: (file) => import_path5.default.join(sqlJsDistPath, file)
-  });
-  const userData = import_electron2.app.getPath("userData");
-  if (!(0, import_fs4.existsSync)(userData)) {
-    (0, import_fs4.mkdirSync)(userData, { recursive: true });
-  }
-  dbPath = import_path5.default.join(userData, DB_FILENAME);
-  if ((0, import_fs4.existsSync)(dbPath)) {
-    db = await openWithFallback(SQL, dbPath);
-  } else {
-    db = new SQL.Database();
-  }
-  runMigrations(db);
-  await persist();
-  return db;
-}
-function getDb() {
-  if (!db) throw new Error("Database not initialized. Call initDb() first.");
-  return db;
-}
-function persist() {
-  persistQueue = persistQueue.then(async () => {
-    if (!db || !dbPath) return;
-    const data = db.export();
-    const tmpPath = `${dbPath}.tmp`;
-    try {
-      await (0, import_promises2.writeFile)(tmpPath, data);
-      await (0, import_promises2.rename)(tmpPath, dbPath);
-    } catch (err) {
-      try {
-        await (0, import_promises2.unlink)(tmpPath);
-      } catch {
-      }
-      throw err;
-    }
-  });
-  return persistQueue;
-}
-async function closeDb() {
-  await persistQueue;
-  if (db) {
-    db.close();
-    db = null;
-  }
-}
-function countRows(database, tables) {
-  let total = 0;
-  for (const table of tables) {
-    const result = database.exec(`SELECT COUNT(*) FROM ${table}`)[0];
-    const value = result?.values?.[0]?.[0];
-    total += typeof value === "number" ? value : Number(value ?? 0);
-  }
-  return total;
-}
-async function getDbStats() {
-  const database = getDb();
-  await persistQueue;
-  const sizeBytes = dbPath && (0, import_fs4.existsSync)(dbPath) ? (0, import_fs4.statSync)(dbPath).size : 0;
-  const groups = Object.fromEntries(
-    Object.entries(DB_TABLE_GROUPS).map(
-      ([key, tables]) => [key, { rowCount: countRows(database, tables), tables: [...tables] }]
-    )
-  );
-  return { sizeBytes, path: dbPath ?? "", groups };
-}
-async function clearTables(groups) {
-  const database = getDb();
-  const tables = /* @__PURE__ */ new Set();
-  for (const group of groups) {
-    const list = DB_TABLE_GROUPS[group];
-    if (!list) continue;
-    for (const table of list) tables.add(table);
-  }
-  if (tables.size > 0) {
-    database.exec("BEGIN TRANSACTION");
-    try {
-      for (const table of tables) {
-        database.exec(`DELETE FROM ${table}`);
-      }
-      database.exec("COMMIT");
-      database.exec("VACUUM");
-    } catch (error) {
-      database.exec("ROLLBACK");
-      throw error;
-    }
-    await persist();
-  }
-  return getDbStats();
-}
-
-// src/electron/credential-store.ts
-var import_electron3 = require("electron");
-function isCredentialEncryptionAvailable() {
-  return import_electron3.safeStorage.isEncryptionAvailable();
-}
-function encryptPassword(plain) {
-  if (!plain) return null;
-  if (!import_electron3.safeStorage.isEncryptionAvailable()) {
-    throw new Error("Credential encryption is not available on this system");
-  }
-  return import_electron3.safeStorage.encryptString(plain);
-}
-function decryptPassword(blob) {
-  if (!blob || blob.length === 0) return null;
-  if (!import_electron3.safeStorage.isEncryptionAvailable()) {
-    throw new Error("Credential encryption is not available on this system");
-  }
-  return import_electron3.safeStorage.decryptString(blob);
-}
-
-// src/electron/saved-hosts.ts
-var rowToHost = (row) => ({
-  id: row.id,
-  label: row.label,
-  hostname: row.hostname,
-  port: row.port,
-  username: row.username,
-  authMethod: row.auth_method,
-  hasPassword: Boolean(row.password_encrypted && row.password_encrypted.length > 0),
-  identityFile: row.identity_file ?? void 0,
-  color: row.color ?? void 0,
-  createdAt: row.created_at,
-  updatedAt: row.updated_at
-});
-var selectAll = `
-    SELECT id, label, hostname, port, username, auth_method,
-           password_encrypted, identity_file, color, created_at, updated_at
-    FROM saved_hosts
-    ORDER BY label COLLATE NOCASE ASC
-`;
-var selectById = `
-    SELECT id, label, hostname, port, username, auth_method,
-           password_encrypted, identity_file, color, created_at, updated_at
-    FROM saved_hosts WHERE id = $id
-`;
-var rowsFromStmt = (sql, params = []) => {
-  const db2 = getDb();
-  const stmt = db2.prepare(sql);
-  try {
-    stmt.bind(params);
-    const result = [];
-    while (stmt.step()) {
-      result.push(stmt.getAsObject());
-    }
-    return result;
-  } finally {
-    stmt.free();
-  }
-};
-function listSavedHosts() {
-  return rowsFromStmt(selectAll).map(rowToHost);
-}
-function getSavedHost(id) {
-  const rows = rowsFromStmt(selectById, { $id: id });
-  return rows[0] ? rowToHost(rows[0]) : null;
-}
-async function createSavedHost(input) {
-  const db2 = getDb();
-  const now = Date.now();
-  const encrypted = input.password ? encryptPassword(input.password) : null;
-  const port = input.port ?? 22;
-  db2.run(
-    `INSERT INTO saved_hosts
-            (label, hostname, port, username, auth_method, password_encrypted, identity_file, color, created_at, updated_at)
-         VALUES ($label, $hostname, $port, $username, $auth, $pwd, $identity, $color, $created, $updated)`,
-    {
-      $label: input.label,
-      $hostname: input.hostname,
-      $port: port,
-      $username: input.username,
-      $auth: input.authMethod,
-      $pwd: encrypted ?? null,
-      $identity: input.identityFile ?? null,
-      $color: input.color ?? null,
-      $created: now,
-      $updated: now
-    }
-  );
-  const result = db2.exec("SELECT last_insert_rowid() AS id");
-  const id = Number(result[0]?.values[0]?.[0] ?? 0);
-  await persist();
-  return getSavedHost(id);
-}
-async function updateSavedHost(id, input) {
-  const db2 = getDb();
-  const now = Date.now();
-  const port = input.port ?? 22;
-  const shouldUpdatePassword = input.password !== void 0 && input.password !== null;
-  const newEncrypted = shouldUpdatePassword && input.password !== "" ? encryptPassword(input.password) : null;
-  if (shouldUpdatePassword) {
-    db2.run(
-      `UPDATE saved_hosts SET
-                label=$label, hostname=$hostname, port=$port, username=$username,
-                auth_method=$auth, password_encrypted=$pwd, identity_file=$identity,
-                color=$color, updated_at=$updated
-             WHERE id=$id`,
-      {
-        $id: id,
-        $label: input.label,
-        $hostname: input.hostname,
-        $port: port,
-        $username: input.username,
-        $auth: input.authMethod,
-        $pwd: newEncrypted ?? null,
-        $identity: input.identityFile ?? null,
-        $color: input.color ?? null,
-        $updated: now
-      }
-    );
-  } else {
-    db2.run(
-      `UPDATE saved_hosts SET
-                label=$label, hostname=$hostname, port=$port, username=$username,
-                auth_method=$auth, identity_file=$identity, color=$color, updated_at=$updated
-             WHERE id=$id`,
-      {
-        $id: id,
-        $label: input.label,
-        $hostname: input.hostname,
-        $port: port,
-        $username: input.username,
-        $auth: input.authMethod,
-        $identity: input.identityFile ?? null,
-        $color: input.color ?? null,
-        $updated: now
-      }
-    );
-  }
-  await persist();
-  const updated = getSavedHost(id);
-  if (!updated) throw new Error(`Saved host ${id} not found after update`);
-  return updated;
-}
-async function deleteSavedHost(id) {
-  const db2 = getDb();
-  db2.run("DELETE FROM saved_hosts WHERE id = $id", { $id: id });
-  await persist();
-  return true;
-}
-function savedHostToSshHost(saved) {
-  return {
-    id: `saved:${saved.id}`,
-    alias: saved.label,
-    hostname: saved.hostname,
-    user: saved.username,
-    port: saved.port,
-    identityFile: saved.identityFile,
-    source: "saved",
-    savedId: saved.id,
-    authMethod: saved.authMethod,
-    color: saved.color
-  };
-}
-function getSavedHostPassword(id) {
-  const rows = rowsFromStmt(selectById, { $id: id });
-  const row = rows[0];
-  if (!row || !row.password_encrypted || row.password_encrypted.length === 0) return null;
-  return decryptPassword(Buffer.from(row.password_encrypted));
-}
-
-// src/electron/host-overrides.ts
-var rowToOverride = (row) => ({
-  hostId: row.host_id,
-  customAlias: row.custom_alias,
-  color: row.color,
-  notes: row.notes,
-  hidden: row.hidden === 1,
-  username: row.username,
-  hasPassword: Boolean(row.password_encrypted && row.password_encrypted.length > 0),
-  authMethod: row.auth_method,
-  createdAt: row.created_at,
-  updatedAt: row.updated_at
-});
-var queryRows = (sql, params = []) => {
-  const db2 = getDb();
-  const stmt = db2.prepare(sql);
-  try {
-    stmt.bind(params);
-    const out = [];
-    while (stmt.step()) out.push(stmt.getAsObject());
-    return out;
-  } finally {
-    stmt.free();
-  }
-};
-function listOverrides() {
-  return queryRows("SELECT * FROM host_overrides").map(rowToOverride);
-}
-function getOverride(hostId) {
-  const rows = queryRows("SELECT * FROM host_overrides WHERE host_id = $id", { $id: hostId });
-  return rows[0] ? rowToOverride(rows[0]) : null;
-}
-function getOverridePassword(hostId) {
-  const rows = queryRows(
-    "SELECT password_encrypted FROM host_overrides WHERE host_id = $id",
-    { $id: hostId }
-  );
-  const row = rows[0];
-  if (!row || !row.password_encrypted || row.password_encrypted.length === 0) return null;
-  return decryptPassword(Buffer.from(row.password_encrypted));
-}
-async function upsertOverride(hostId, patch) {
-  const db2 = getDb();
-  const now = Date.now();
-  const existing = getOverride(hostId);
-  const passwordShouldUpdate = patch.password !== void 0;
-  const passwordEncrypted = passwordShouldUpdate && patch.password ? encryptPassword(patch.password) : null;
-  if (existing) {
-    db2.run(
-      `UPDATE host_overrides SET
-                custom_alias = $alias,
-                color = $color,
-                notes = $notes,
-                hidden = $hidden,
-                username = $username,
-                auth_method = $auth,
-                ${passwordShouldUpdate ? "password_encrypted = $pwd," : ""}
-                updated_at = $updated
-             WHERE host_id = $id`,
-      {
-        $id: hostId,
-        $alias: patch.customAlias !== void 0 ? patch.customAlias : existing.customAlias,
-        $color: patch.color !== void 0 ? patch.color : existing.color,
-        $notes: patch.notes !== void 0 ? patch.notes : existing.notes,
-        $hidden: (patch.hidden !== void 0 ? patch.hidden : existing.hidden) ? 1 : 0,
-        $username: patch.username !== void 0 ? patch.username : existing.username,
-        $auth: patch.authMethod !== void 0 ? patch.authMethod : existing.authMethod,
-        ...passwordShouldUpdate ? { $pwd: passwordEncrypted ?? null } : {},
-        $updated: now
-      }
-    );
-  } else {
-    db2.run(
-      `INSERT INTO host_overrides
-                (host_id, custom_alias, color, notes, hidden,
-                 username, password_encrypted, auth_method,
-                 created_at, updated_at)
-             VALUES ($id, $alias, $color, $notes, $hidden,
-                     $username, $pwd, $auth,
-                     $created, $updated)`,
-      {
-        $id: hostId,
-        $alias: patch.customAlias ?? null,
-        $color: patch.color ?? null,
-        $notes: patch.notes ?? null,
-        $hidden: patch.hidden ? 1 : 0,
-        $username: patch.username ?? null,
-        $pwd: passwordEncrypted ?? null,
-        $auth: patch.authMethod ?? null,
-        $created: now,
-        $updated: now
-      }
-    );
-  }
-  await persist();
-  return getOverride(hostId);
-}
-async function deleteOverride(hostId) {
-  const db2 = getDb();
-  db2.run("DELETE FROM host_overrides WHERE host_id = $id", { $id: hostId });
-  await persist();
-}
-
-// src/electron/port-forwards.ts
-var rowToForward = (row) => ({
-  id: row.id,
-  hostId: row.host_id,
-  type: row.type,
-  bindAddress: row.bind_address,
-  bindPort: row.bind_port,
-  targetHost: row.target_host,
-  targetPort: row.target_port,
-  label: row.label,
-  enabled: row.enabled === 1,
-  createdAt: row.created_at,
-  updatedAt: row.updated_at
-});
-var queryRows2 = (sql, params = []) => {
-  const db2 = getDb();
-  const stmt = db2.prepare(sql);
-  try {
-    stmt.bind(params);
-    const out = [];
-    while (stmt.step()) out.push(stmt.getAsObject());
-    return out;
-  } finally {
-    stmt.free();
-  }
-};
-function listPortForwards(hostId) {
-  return queryRows2(
-    "SELECT * FROM port_forwards WHERE host_id = $host ORDER BY id ASC",
-    { $host: hostId }
-  ).map(rowToForward);
-}
-function listAllPortForwards() {
-  return queryRows2("SELECT * FROM port_forwards ORDER BY host_id, id").map(rowToForward);
-}
-async function createPortForward(hostId, input) {
-  const db2 = getDb();
-  const now = Date.now();
-  db2.run(
-    `INSERT INTO port_forwards
-            (host_id, type, bind_address, bind_port, target_host, target_port, label, enabled, created_at, updated_at)
-         VALUES ($host, $type, $bindAddr, $bindPort, $target, $targetPort, $label, $enabled, $created, $updated)`,
-    {
-      $host: hostId,
-      $type: input.type,
-      $bindAddr: input.bindAddress ?? null,
-      $bindPort: input.bindPort,
-      $target: input.targetHost,
-      $targetPort: input.targetPort,
-      $label: input.label ?? null,
-      $enabled: input.enabled ?? true ? 1 : 0,
-      $created: now,
-      $updated: now
-    }
-  );
-  const idRow = db2.exec("SELECT last_insert_rowid() AS id");
-  const id = Number(idRow[0]?.values[0]?.[0] ?? 0);
-  await persist();
-  return listPortForwards(hostId).find((forward) => forward.id === id);
-}
-async function updatePortForward(id, patch) {
-  const db2 = getDb();
-  const current = queryRows2("SELECT * FROM port_forwards WHERE id = $id", { $id: id })[0];
-  if (!current) return;
-  db2.run(
-    `UPDATE port_forwards SET
-            type = $type,
-            bind_address = $bindAddr,
-            bind_port = $bindPort,
-            target_host = $target,
-            target_port = $targetPort,
-            label = $label,
-            enabled = $enabled,
-            updated_at = $updated
-         WHERE id = $id`,
-    {
-      $id: id,
-      $type: patch.type ?? current.type,
-      $bindAddr: patch.bindAddress !== void 0 ? patch.bindAddress : current.bind_address,
-      $bindPort: patch.bindPort ?? current.bind_port,
-      $target: patch.targetHost ?? current.target_host,
-      $targetPort: patch.targetPort ?? current.target_port,
-      $label: patch.label !== void 0 ? patch.label : current.label,
-      $enabled: (patch.enabled !== void 0 ? patch.enabled : current.enabled === 1) ? 1 : 0,
-      $updated: Date.now()
-    }
-  );
-  await persist();
-}
-async function deletePortForward(id) {
-  const db2 = getDb();
-  db2.run("DELETE FROM port_forwards WHERE id = $id", { $id: id });
-  await persist();
-}
-
-// src/electron/ssh-hosts.ts
-var applyOverrides = (hosts) => {
-  const overrides = new Map(listOverrides().map((override) => [override.hostId, override]));
-  return hosts.map((host) => {
-    const override = overrides.get(host.id);
-    if (!override) return host;
-    return {
-      ...host,
-      originalAlias: host.alias,
-      customAlias: override.customAlias ?? void 0,
-      alias: override.customAlias || host.alias,
-      color: override.color ?? host.color,
-      notes: override.notes ?? void 0,
-      hidden: override.hidden,
-      originalUser: host.user,
-      user: override.username ?? host.user,
-      authMethod: override.authMethod ?? host.authMethod,
-      hasOverridePassword: override.hasPassword
-    };
-  });
-};
-var applyForwardCounts = (hosts) => {
-  const counts = /* @__PURE__ */ new Map();
-  for (const forward of listAllPortForwards()) {
-    if (!forward.enabled) continue;
-    counts.set(forward.hostId, (counts.get(forward.hostId) ?? 0) + 1);
-  }
-  return hosts.map((host) => {
-    const count = counts.get(host.id);
-    return count ? { ...host, forwardCount: count } : host;
-  });
-};
-async function listAllSshHosts() {
-  const [fileHosts, savedHosts] = await Promise.all([
-    listFileBasedHosts(),
-    Promise.resolve(listSavedHosts())
-  ]);
-  const merged = [...savedHosts.map(savedHostToSshHost), ...fileHosts];
-  const enriched = applyForwardCounts(applyOverrides(merged));
-  return {
-    visible: enriched.filter((host) => !host.hidden),
-    hidden: enriched.filter((host) => host.hidden)
-  };
-}
-
-// src/electron/ssh-manager.ts
-var import_events2 = require("events");
-var import_net2 = __toESM(require("net"), 1);
-var import_os3 = __toESM(require("os"), 1);
-var import_crypto = require("crypto");
-var import_node_pty = require("node-pty");
-var import_ssh2 = require("ssh2");
-
-// src/electron/host-resolver.ts
-var import_child_process4 = require("child_process");
-var import_promises3 = __toESM(require("dns/promises"), 1);
-var import_net = __toESM(require("net"), 1);
-var import_util4 = require("util");
-var execFileAsync2 = (0, import_util4.promisify)(import_child_process4.execFile);
-var IPV4_RE = /^(?:\d{1,3}\.){3}\d{1,3}$/;
-var IPV6_RE = /:/;
-function isIp(value) {
-  return IPV4_RE.test(value) || IPV6_RE.test(value);
-}
-async function lookupViaNode(hostname) {
-  try {
-    const result = await import_promises3.default.lookup(hostname, { family: 4, all: false });
-    return result.address;
-  } catch {
-  }
-  try {
-    const result = await import_promises3.default.lookup(hostname, { family: 6, all: false });
-    return result.address;
-  } catch {
-    return null;
-  }
-}
-async function lookupViaSystem(hostname) {
-  try {
-    const { stdout } = await execFileAsync2("dscacheutil", ["-q", "host", "-a", "name", hostname], {
-      timeout: 5e3
-    });
-    const match = stdout.match(/ipv4_address:\s*(\S+)/) ?? stdout.match(/ip_address:\s*(\S+)/);
-    return match ? match[1] : null;
-  } catch {
-    return null;
-  }
-}
-async function resolveHost(hostname) {
-  if (isIp(hostname)) {
-    return { address: hostname, via: "literal" };
-  }
-  if (hostname.endsWith(".ts.net") || hostname.includes(".tail")) {
-    const fromSystem2 = await lookupViaSystem(hostname);
-    if (fromSystem2) return { address: fromSystem2, via: "system" };
-  }
-  const fromNode = await lookupViaNode(hostname);
-  if (fromNode) return { address: fromNode, via: "dns" };
-  const fromSystem = await lookupViaSystem(hostname);
-  if (fromSystem) return { address: fromSystem, via: "system" };
-  return { address: hostname, via: "unresolved" };
-}
-async function tcpPreflight(address, port, timeoutMs = 8e3) {
-  return new Promise((resolve, reject) => {
-    const socket = import_net.default.connect({ host: address, port });
-    const timer = setTimeout(() => {
-      socket.destroy();
-      reject(new Error(`TCP timeout connecting to ${address}:${port}`));
-    }, timeoutMs);
-    socket.once("connect", () => {
-      clearTimeout(timer);
-      socket.end();
-      resolve();
-    });
-    socket.once("error", (err) => {
-      clearTimeout(timer);
-      reject(new Error(`TCP error: ${err.message}`));
-    });
-  });
-}
-
-// src/electron/ssh-manager.ts
-var enabledForwards = (hostId) => listPortForwards(hostId).filter((forward) => forward.enabled);
-var buildSshCliArgs = (host) => {
-  const args = [];
-  for (const forward of enabledForwards(host.id)) {
-    const bind = forward.bindAddress || (forward.type === "local" ? "127.0.0.1" : "");
-    const flag = forward.type === "local" ? "-L" : "-R";
-    const spec = bind ? `${bind}:${forward.bindPort}:${forward.targetHost}:${forward.targetPort}` : `${forward.bindPort}:${forward.targetHost}:${forward.targetPort}`;
-    args.push(flag, spec);
-  }
-  if (host.source === "config") {
-    args.push(host.alias);
-    return args;
-  }
-  if (host.port) args.push("-p", String(host.port));
-  args.push(host.hostname);
-  return args;
-};
-var SshManager = class extends import_events2.EventEmitter {
-  sessions = /* @__PURE__ */ new Map();
-  emitData(sessionId, data) {
-    const session = this.sessions.get(sessionId);
-    if (session?.kind === "ssh2" && session.pendingPrefix) {
-      this.emit("data", { sessionId, data: session.pendingPrefix + data });
-      session.pendingPrefix = "";
-      return;
-    }
-    this.emit("data", { sessionId, data });
-  }
-  appendPending(session, data) {
-    session.pendingPrefix += data;
-    if (session.pendingPrefix.length > 4096) {
-      session.pendingPrefix = session.pendingPrefix.slice(-4096);
-    }
-  }
-  list() {
-    return Array.from(this.sessions.values()).map((session) => ({
-      sessionId: session.id,
-      host: session.host
-    }));
-  }
-  async create(host, cols = 120, rows = 30) {
-    if (host.source === "saved") {
-      return this.createSavedSsh2Session(host, cols, rows);
-    }
-    if (host.hasOverridePassword) {
-      return this.createOverrideSsh2Session(host, cols, rows);
-    }
-    return this.createPtySession(host, cols, rows);
-  }
-  async createOverrideSsh2Session(host, cols, rows) {
-    const password = getOverridePassword(host.id);
-    if (!password) {
-      throw new Error("Override password is unavailable or not stored");
-    }
-    if (!host.user) {
-      throw new Error("Override requires a username");
-    }
-    return this.openSsh2Stream({
-      host,
-      cols,
-      rows,
-      target: {
-        hostname: host.hostname,
-        port: host.port ?? 22,
-        username: host.user,
-        password
-      }
-    });
-  }
-  createPtySession(host, cols, rows) {
-    const id = (0, import_crypto.randomUUID)();
-    const args = buildSshCliArgs(host);
-    const pty = (0, import_node_pty.spawn)("ssh", args, {
-      name: "xterm-256color",
-      cols,
-      rows,
-      cwd: import_os3.default.homedir(),
-      env: process.env
-    });
-    const session = { id, host, kind: "pty", pty };
-    this.sessions.set(id, session);
-    pty.onData((data) => this.emit("data", { sessionId: id, data }));
-    pty.onExit(({ exitCode, signal }) => {
-      this.sessions.delete(id);
-      this.emit("exit", { sessionId: id, exitCode, signal });
-    });
-    return { sessionId: id };
-  }
-  async createSavedSsh2Session(host, cols, rows) {
-    const savedId = host.savedId;
-    if (!savedId) {
-      throw new Error("saved host missing savedId");
-    }
-    const saved = getSavedHost(savedId);
-    if (!saved) {
-      throw new Error(`Saved host ${savedId} not found`);
-    }
-    const password = saved.authMethod === "password" ? getSavedHostPassword(savedId) : null;
-    if (saved.authMethod === "password" && !password) {
-      throw new Error("Password is not stored for this host");
-    }
-    return this.openSsh2Stream({
-      host,
-      cols,
-      rows,
-      target: {
-        hostname: saved.hostname,
-        port: saved.port,
-        username: saved.username,
-        password: password ?? void 0
-      }
-    });
-  }
-  openSsh2Stream(args) {
-    const { host, cols, rows, target } = args;
-    const id = (0, import_crypto.randomUUID)();
-    const client = new import_ssh2.Client();
-    const resolvePromise = resolveHost(target.hostname);
-    const session = {
-      id,
-      host,
-      kind: "ssh2",
-      client,
-      stream: null,
-      forwardServers: [],
-      remoteForwards: [],
-      pendingPrefix: ""
-    };
-    this.sessions.set(id, session);
-    const fail = (err) => {
-      this.cleanupSsh2Tunnels(session);
-      this.sessions.delete(id);
-      this.emit("exit", { sessionId: id, exitCode: 1, error: err.message });
-    };
-    client.on("error", (err) => {
-      const hint = /handshake/i.test(err.message) ? " (TCP works but the SSH service did not respond. Wrong port, sshd down, or a Tailscale ACL blocking port?)" : "";
-      this.emitData(id, `\r
-\x1B[31mError: ${err.message}${hint}\x1B[0m\r
-`);
-      fail(err);
-    });
-    client.on("end", () => {
-      this.cleanupSsh2Tunnels(session);
-      this.sessions.delete(id);
-      this.emit("exit", { sessionId: id, exitCode: 0 });
-    });
-    client.on("tcp connection", (info, accept, reject) => {
-      const match = session.remoteForwards.find(
-        (f) => f.address === info.destIP && f.port === info.destPort
-      );
-      const forwardConfig = match ? enabledForwards(host.id).find(
-        (f) => f.type === "remote" && (f.bindAddress || "") === info.destIP && f.bindPort === info.destPort
-      ) : void 0;
-      if (!forwardConfig) {
-        reject();
-        return;
-      }
-      const local = import_net2.default.connect(forwardConfig.targetPort, forwardConfig.targetHost);
-      local.on("error", () => reject());
-      local.on("connect", () => {
-        const remote = accept();
-        local.pipe(remote).pipe(local);
-      });
-    });
-    client.on("ready", () => {
-      this.emitData(
-        id,
-        `\x1B[32mConnected to ${target.username}@${target.hostname}:${target.port}\x1B[0m\r
-`
-      );
-      this.setupSsh2Tunnels(session);
-      client.shell({ term: "xterm-256color", cols, rows }, (err, stream) => {
-        if (err) {
-          fail(err);
-          return;
-        }
-        session.stream = stream;
-        stream.on("data", (data) => {
-          this.emit("data", { sessionId: id, data: data.toString("utf-8") });
-        });
-        stream.stderr.on("data", (data) => {
-          this.emit("data", { sessionId: id, data: data.toString("utf-8") });
-        });
-        stream.on("close", () => {
-          try {
-            client.end();
-          } catch {
-          }
-        });
-      });
-    });
-    resolvePromise.then(async ({ address, via }) => {
-      if (via === "unresolved") {
-        this.emitData(
-          id,
-          `\r
-\x1B[31mCould not resolve ${target.hostname}. For Tailscale: try the 100.x.x.x IP or full \`.ts.net\` name.\x1B[0m\r
-`
-        );
-        fail(new Error(`Could not resolve ${target.hostname}`));
-        return;
-      }
-      if (via !== "literal") {
-        this.appendPending(
-          session,
-          `\x1B[36mResolved ${target.hostname} \u2192 ${address} (${via})\x1B[0m\r
-`
-        );
-      }
-      try {
-        await tcpPreflight(address, target.port, 8e3);
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        this.emitData(
-          id,
-          `\r
-\x1B[31m${message}. Tailscale tunnel up? Try \`tailscale status\` / \`tailscale ping ${target.hostname}\`.\x1B[0m\r
-`
-        );
-        fail(err instanceof Error ? err : new Error(message));
-        return;
-      }
-      this.appendPending(session, `\x1B[36mTCP ok ${address}:${target.port}, waiting for SSH banner\u2026\x1B[0m\r
-`);
-      try {
-        client.connect({
-          host: address,
-          port: target.port,
-          username: target.username,
-          password: target.password,
-          readyTimeout: 3e4,
-          keepaliveInterval: 3e4
-        });
-      } catch (err) {
-        fail(err);
-      }
-    }).catch((err) => fail(err));
-    return { sessionId: id };
-  }
-  setupSsh2Tunnels(session) {
-    const forwards = enabledForwards(session.host.id);
-    if (forwards.length === 0) return;
-    const emitInfo = (message) => {
-      this.emit("data", { sessionId: session.id, data: `\x1B[36m${message}\x1B[0m\r
-` });
-    };
-    const emitError = (message) => {
-      this.emit("data", { sessionId: session.id, data: `\x1B[31m${message}\x1B[0m\r
-` });
-    };
-    for (const forward of forwards) {
-      if (forward.type === "local") {
-        const bindAddr = forward.bindAddress || "127.0.0.1";
-        const server = import_net2.default.createServer((local) => {
-          session.client.forwardOut(
-            bindAddr,
-            forward.bindPort,
-            forward.targetHost,
-            forward.targetPort,
-            (err, remote) => {
-              if (err) {
-                local.end();
-                emitError(
-                  `Tunnel ${bindAddr}:${forward.bindPort} \u2192 ${forward.targetHost}:${forward.targetPort} failed: ${err.message}`
-                );
-                return;
-              }
-              local.pipe(remote).pipe(local);
-            }
-          );
-        });
-        server.on("error", (err) => {
-          emitError(`Tunnel ${bindAddr}:${forward.bindPort} error: ${err.message}`);
-        });
-        server.listen(forward.bindPort, bindAddr, () => {
-          emitInfo(
-            `Tunnel -L ${bindAddr}:${forward.bindPort} \u2192 ${forward.targetHost}:${forward.targetPort} ready`
-          );
-        });
-        session.forwardServers.push(server);
-      } else {
-        const bindAddr = forward.bindAddress || "";
-        session.client.forwardIn(bindAddr, forward.bindPort, (err, port) => {
-          if (err) {
-            emitError(`Reverse tunnel ${bindAddr}:${forward.bindPort} failed: ${err.message}`);
-            return;
-          }
-          session.remoteForwards.push({ address: bindAddr, port });
-          emitInfo(
-            `Tunnel -R ${bindAddr}:${port} \u2192 ${forward.targetHost}:${forward.targetPort} ready`
-          );
-        });
-      }
-    }
-  }
-  cleanupSsh2Tunnels(session) {
-    for (const server of session.forwardServers) {
-      try {
-        server.close();
-      } catch {
-      }
-    }
-    session.forwardServers = [];
-    for (const remote of session.remoteForwards) {
-      try {
-        session.client.unforwardIn(remote.address, remote.port, () => {
-        });
-      } catch {
-      }
-    }
-    session.remoteForwards = [];
-  }
-  write(sessionId, data) {
-    const session = this.sessions.get(sessionId);
-    if (!session) return false;
-    if (session.kind === "pty") {
-      session.pty.write(data);
-      return true;
-    }
-    if (session.stream) {
-      session.stream.write(data);
-      return true;
-    }
-    return false;
-  }
-  resize(sessionId, cols, rows) {
-    const session = this.sessions.get(sessionId);
-    if (!session) return false;
-    const safeCols = Math.max(cols, 1);
-    const safeRows = Math.max(rows, 1);
-    try {
-      if (session.kind === "pty") {
-        session.pty.resize(safeCols, safeRows);
-        return true;
-      }
-      if (session.stream) {
-        session.stream.setWindow(safeRows, safeCols, 0, 0);
-        return true;
-      }
-      return false;
-    } catch {
-      return false;
-    }
-  }
-  close(sessionId) {
-    const session = this.sessions.get(sessionId);
-    if (!session) return false;
-    try {
-      if (session.kind === "pty") {
-        session.pty.kill();
-      } else {
-        this.cleanupSsh2Tunnels(session);
-        session.stream?.end();
-        session.client.end();
-      }
-    } catch {
-    }
-    this.sessions.delete(sessionId);
-    return true;
-  }
-  dispose() {
-    for (const session of this.sessions.values()) {
-      try {
-        if (session.kind === "pty") {
-          session.pty.kill();
-        } else {
-          this.cleanupSsh2Tunnels(session);
-          session.stream?.end();
-          session.client.end();
-        }
-      } catch {
-      }
-    }
-    this.sessions.clear();
-  }
-};
-
-// src/electron/settings-store.ts
-var import_fs5 = require("fs");
-var import_promises4 = require("fs/promises");
-var import_path6 = __toESM(require("path"), 1);
-var import_electron4 = require("electron");
-var SETTINGS_FILENAME = "app-settings.json";
-var DEFAULT_SETTINGS = {
-  theme: "system",
-  popup: {
-    showMedia: true,
-    showBluetooth: true,
-    showSystem: true,
-    showSsh: true,
-    showDocker: true
-  },
-  hotkey: {
-    enabled: true,
-    combo: "Cmd+Shift+M"
-  }
-};
-var cached = null;
-var writeQueue = Promise.resolve();
-function settingsPath() {
-  const userData = import_electron4.app.getPath("userData");
-  if (!(0, import_fs5.existsSync)(userData)) (0, import_fs5.mkdirSync)(userData, { recursive: true });
-  return import_path6.default.join(userData, SETTINGS_FILENAME);
-}
-function mergeWithDefaults(partial) {
-  return {
-    theme: partial?.theme ?? DEFAULT_SETTINGS.theme,
-    popup: { ...DEFAULT_SETTINGS.popup, ...partial?.popup ?? {} },
-    hotkey: { ...DEFAULT_SETTINGS.hotkey, ...partial?.hotkey ?? {} }
-  };
-}
-async function loadSettings() {
-  if (cached) return cached;
-  const file = settingsPath();
-  if (!(0, import_fs5.existsSync)(file)) {
-    cached = { ...DEFAULT_SETTINGS, popup: { ...DEFAULT_SETTINGS.popup } };
-    return cached;
-  }
-  try {
-    const raw = await (0, import_promises4.readFile)(file, "utf8");
-    cached = mergeWithDefaults(JSON.parse(raw));
-    return cached;
-  } catch {
-    cached = { ...DEFAULT_SETTINGS, popup: { ...DEFAULT_SETTINGS.popup } };
-    return cached;
-  }
-}
-async function updateSettings(patch) {
-  const current = await loadSettings();
-  const next = {
-    theme: patch.theme ?? current.theme,
-    popup: { ...current.popup, ...patch.popup ?? {} },
-    hotkey: { ...current.hotkey, ...patch.hotkey ?? {} }
-  };
-  cached = next;
-  const file = settingsPath();
-  writeQueue = writeQueue.then(() => (0, import_promises4.writeFile)(file, JSON.stringify(next, null, 2)));
-  await writeQueue;
-  return next;
-}
-
-// src/electron/media-history.ts
+// src/features/media/media-history.ts
 var rowToEntry = (row) => ({
   id: row.id,
   title: row.title,
@@ -13564,7 +14653,7 @@ async function clearAllStats() {
   await persist();
 }
 
-// src/electron/media-tracker.ts
+// src/features/media/media-tracker.ts
 var POLL_INTERVAL_MS = 5e3;
 var trackKey = (track) => `${track.bundleId ?? ""}|${track.title ?? ""}|${track.artist ?? ""}|${track.album ?? ""}`;
 var MediaTracker = class {
@@ -13572,8 +14661,8 @@ var MediaTracker = class {
   active = null;
   running = false;
   mediaManager;
-  constructor(mediaManager2) {
-    this.mediaManager = mediaManager2;
+  constructor(mediaManager) {
+    this.mediaManager = mediaManager;
   }
   start() {
     if (this.timer) return;
@@ -13639,1179 +14728,201 @@ var MediaTracker = class {
   }
 };
 
-// src/electron/ssh-file-ops.ts
-var import_child_process5 = require("child_process");
-var import_os4 = __toESM(require("os"), 1);
-var import_path7 = __toESM(require("path"), 1);
-var import_util5 = require("util");
-var execFileAsync3 = (0, import_util5.promisify)(import_child_process5.execFile);
-var KNOWN_HOSTS_PATH2 = import_path7.default.join(import_os4.default.homedir(), ".ssh", "known_hosts");
-async function removeFromKnownHosts(hostname) {
-  if (!hostname || hostname.trim().length === 0) {
-    return { success: false, error: "hostname is empty" };
-  }
-  try {
-    await execFileAsync3("ssh-keygen", ["-R", hostname, "-f", KNOWN_HOSTS_PATH2], {
-      timeout: 1e4
-    });
-    return { success: true };
-  } catch (error) {
-    return {
-      success: false,
-      error: error instanceof Error ? error.message : String(error)
-    };
-  }
-}
-
-// src/electron/docker-manager.ts
-var import_events3 = require("events");
-var import_child_process6 = require("child_process");
-var import_util6 = require("util");
-var import_crypto2 = require("crypto");
-var import_node_pty2 = require("node-pty");
-var execFileP = (0, import_util6.promisify)(import_child_process6.execFile);
-var RUN_TIMEOUT = 3e4;
-var PRUNE_TIMEOUT = 12e4;
-var parseJsonLines = (stdout, map) => {
-  return stdout.split("\n").filter((line) => line.trim().length > 0).map((line) => {
-    try {
-      return map(JSON.parse(line));
-    } catch {
-      return null;
-    }
-  }).filter((value) => value !== null);
-};
-var DockerManager = class extends import_events3.EventEmitter {
-  execSessions = /* @__PURE__ */ new Map();
-  async isAvailable() {
-    try {
-      const { stdout } = await execFileP(
-        "docker",
-        ["version", "--format", "{{.Server.Version}}"],
-        { timeout: 4e3 }
-      );
-      const version = stdout.trim();
-      if (!version) {
-        return { available: false, error: "Docker daemon not responding" };
-      }
-      return { available: true, version };
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      return { available: false, error: message };
-    }
-  }
-  async listContainers() {
-    const { stdout } = await execFileP(
-      "docker",
-      ["container", "ls", "-a", "--format", "{{json .}}"],
-      { timeout: RUN_TIMEOUT, maxBuffer: 4 * 1024 * 1024 }
-    );
-    return parseJsonLines(stdout, (raw) => ({
-      id: raw.ID ?? "",
-      name: raw.Names ?? "",
-      image: raw.Image ?? "",
-      state: (raw.State ?? "").toLowerCase(),
-      status: raw.Status ?? "",
-      ports: raw.Ports ?? "",
-      command: raw.Command ?? "",
-      createdAt: raw.CreatedAt ?? "",
-      size: raw.Size ?? ""
-    }));
-  }
-  async listImages() {
-    const { stdout } = await execFileP(
-      "docker",
-      ["image", "ls", "--format", "{{json .}}"],
-      { timeout: RUN_TIMEOUT, maxBuffer: 4 * 1024 * 1024 }
-    );
-    return parseJsonLines(stdout, (raw) => ({
-      id: raw.ID ?? "",
-      repository: raw.Repository ?? "",
-      tag: raw.Tag ?? "",
-      size: raw.Size ?? "",
-      createdSince: raw.CreatedSince ?? ""
-    }));
-  }
-  async listVolumes() {
-    const { stdout } = await execFileP(
-      "docker",
-      ["volume", "ls", "--format", "{{json .}}"],
-      { timeout: RUN_TIMEOUT, maxBuffer: 2 * 1024 * 1024 }
-    );
-    return parseJsonLines(stdout, (raw) => ({
-      name: raw.Name ?? "",
-      driver: raw.Driver ?? "",
-      mountpoint: raw.Mountpoint ?? "",
-      scope: raw.Scope ?? ""
-    }));
-  }
-  async listNetworks() {
-    const { stdout } = await execFileP(
-      "docker",
-      ["network", "ls", "--format", "{{json .}}"],
-      { timeout: RUN_TIMEOUT, maxBuffer: 2 * 1024 * 1024 }
-    );
-    return parseJsonLines(stdout, (raw) => ({
-      id: raw.ID ?? "",
-      name: raw.Name ?? "",
-      driver: raw.Driver ?? "",
-      scope: raw.Scope ?? ""
-    }));
-  }
-  async runImage(options) {
-    const args = ["run"];
-    const detached = options.detached !== false;
-    if (detached) args.push("-d");
-    if (options.autoRemove) args.push("--rm");
-    if (options.name && options.name.trim()) {
-      args.push("--name", options.name.trim());
-    }
-    for (const port of options.ports ?? []) {
-      const host = port.host.trim();
-      const container = port.container.trim();
-      if (!host || !container) continue;
-      args.push("-p", `${host}:${container}`);
-    }
-    for (const env of options.env ?? []) {
-      const key = env.key.trim();
-      if (!key) continue;
-      args.push("-e", `${key}=${env.value}`);
-    }
-    for (const volume of options.volumes ?? []) {
-      const host = volume.host.trim();
-      const container = volume.container.trim();
-      if (!host || !container) continue;
-      args.push("-v", `${host}:${container}`);
-    }
-    args.push(options.image);
-    if (options.command && options.command.trim()) {
-      const tokens = options.command.trim().split(/\s+/);
-      args.push(...tokens);
-    }
-    const { stdout } = await execFileP("docker", args, { timeout: RUN_TIMEOUT });
-    return { containerId: stdout.trim() };
-  }
-  async startContainer(id) {
-    await execFileP("docker", ["start", id], { timeout: RUN_TIMEOUT });
-  }
-  async stopContainer(id) {
-    await execFileP("docker", ["stop", id], { timeout: RUN_TIMEOUT });
-  }
-  async restartContainer(id) {
-    await execFileP("docker", ["restart", id], { timeout: RUN_TIMEOUT });
-  }
-  async removeContainer(id, force = false) {
-    const args = ["rm", ...force ? ["-f"] : [], id];
-    await execFileP("docker", args, { timeout: RUN_TIMEOUT });
-  }
-  async removeImage(id, force = false) {
-    const args = ["rmi", ...force ? ["-f"] : [], id];
-    await execFileP("docker", args, { timeout: RUN_TIMEOUT });
-  }
-  async removeVolume(name, force = false) {
-    const args = ["volume", "rm", ...force ? ["-f"] : [], name];
-    await execFileP("docker", args, { timeout: RUN_TIMEOUT });
-  }
-  async removeNetwork(name) {
-    await execFileP("docker", ["network", "rm", name], { timeout: RUN_TIMEOUT });
-  }
-  async pruneContainers() {
-    const { stdout } = await execFileP("docker", ["container", "prune", "-f"], { timeout: PRUNE_TIMEOUT });
-    return stdout;
-  }
-  async pruneImages(all = false) {
-    const args = ["image", "prune", "-f", ...all ? ["-a"] : []];
-    const { stdout } = await execFileP("docker", args, { timeout: PRUNE_TIMEOUT });
-    return stdout;
-  }
-  async pruneVolumes() {
-    const { stdout } = await execFileP("docker", ["volume", "prune", "-f"], { timeout: PRUNE_TIMEOUT });
-    return stdout;
-  }
-  async pruneNetworks() {
-    const { stdout } = await execFileP("docker", ["network", "prune", "-f"], { timeout: PRUNE_TIMEOUT });
-    return stdout;
-  }
-  async pruneSystem(all = false) {
-    const args = ["system", "prune", "-f", ...all ? ["-a"] : []];
-    const { stdout } = await execFileP("docker", args, { timeout: PRUNE_TIMEOUT });
-    return stdout;
-  }
-  async getLogs(containerId, tail = 500) {
-    const { stdout, stderr } = await execFileP(
-      "docker",
-      ["logs", "--tail", String(tail), "--timestamps", containerId],
-      { timeout: 15e3, maxBuffer: 16 * 1024 * 1024 }
-    );
-    return stdout + stderr;
-  }
-  startExec(containerId, containerName, cols = 120, rows = 30) {
-    const id = (0, import_crypto2.randomUUID)();
-    const shellCmd = "[ -x /bin/bash ] && exec /bin/bash || exec /bin/sh";
-    const pty = (0, import_node_pty2.spawn)(
-      "docker",
-      ["exec", "-it", containerId, "/bin/sh", "-c", shellCmd],
-      {
-        name: "xterm-256color",
-        cols,
-        rows,
-        cwd: process.cwd(),
-        env: process.env
-      }
-    );
-    this.execSessions.set(id, { id, pty, containerId, containerName });
-    pty.onData((data) => this.emit("exec-data", { sessionId: id, data }));
-    pty.onExit(({ exitCode, signal }) => {
-      this.execSessions.delete(id);
-      this.emit("exec-exit", { sessionId: id, exitCode, signal });
-    });
-    return { sessionId: id };
-  }
-  writeExec(sessionId, data) {
-    const session = this.execSessions.get(sessionId);
-    if (!session) return false;
-    session.pty.write(data);
-    return true;
-  }
-  resizeExec(sessionId, cols, rows) {
-    const session = this.execSessions.get(sessionId);
-    if (!session) return false;
-    try {
-      session.pty.resize(Math.max(cols, 1), Math.max(rows, 1));
-      return true;
-    } catch {
-      return false;
-    }
-  }
-  closeExec(sessionId) {
-    const session = this.execSessions.get(sessionId);
-    if (!session) return false;
-    try {
-      session.pty.kill();
-    } catch {
-    }
-    this.execSessions.delete(sessionId);
-    return true;
-  }
-  ownsExec(sessionId) {
-    return this.execSessions.has(sessionId);
-  }
-  dispose() {
-    for (const session of this.execSessions.values()) {
-      try {
-        session.pty.kill();
-      } catch {
-      }
-    }
-    this.execSessions.clear();
-  }
-};
-
-// src/electron/local-fs.ts
-var import_promises5 = require("fs/promises");
-var import_os5 = __toESM(require("os"), 1);
-var import_path8 = __toESM(require("path"), 1);
-async function listLocal(dirPath) {
-  const target = dirPath || import_os5.default.homedir();
-  const entries = await (0, import_promises5.readdir)(target, { withFileTypes: true });
-  const results = await Promise.all(
-    entries.map(async (entry) => {
-      const full = import_path8.default.join(target, entry.name);
-      try {
-        const stats = await (0, import_promises5.stat)(full);
-        return {
-          name: entry.name,
-          path: full,
-          isDir: stats.isDirectory(),
-          isLink: entry.isSymbolicLink(),
-          size: stats.size,
-          mtimeMs: stats.mtimeMs
-        };
-      } catch {
-        return null;
-      }
-    })
-  );
-  return results.filter((entry) => entry !== null).sort((a, b) => {
-    if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
-    return a.name.localeCompare(b.name, void 0, { sensitivity: "base" });
-  });
-}
-function localHome() {
-  return import_os5.default.homedir();
-}
-
-// src/electron/sftp-manager.ts
-var import_crypto3 = require("crypto");
-var import_ssh22 = require("ssh2");
-
-// src/electron/ssh-credentials.ts
-var import_fs6 = require("fs");
-var import_os6 = __toESM(require("os"), 1);
-var import_path9 = __toESM(require("path"), 1);
-function expandHome2(filePath) {
-  if (filePath.startsWith("~/")) return import_path9.default.join(import_os6.default.homedir(), filePath.slice(2));
-  if (filePath === "~") return import_os6.default.homedir();
-  return filePath;
-}
-function loadPrivateKey(filePath) {
-  if (!filePath) return void 0;
-  const expanded = expandHome2(filePath);
-  if (!(0, import_fs6.existsSync)(expanded)) return void 0;
-  try {
-    return (0, import_fs6.readFileSync)(expanded);
-  } catch {
-    return void 0;
-  }
-}
-function resolveCredentials(host) {
-  const agentSocket = process.env.SSH_AUTH_SOCK || void 0;
-  if (host.source === "saved" && host.savedId !== void 0) {
-    const saved = getSavedHost(host.savedId);
-    if (!saved) throw new Error(`Saved host ${host.savedId} not found`);
-    const password = saved.authMethod === "password" ? getSavedHostPassword(host.savedId) : null;
-    const identityFile = saved.identityFile ?? void 0;
-    return {
-      hostname: saved.hostname,
-      port: saved.port,
-      username: saved.username,
-      password: password ?? void 0,
-      identityFile,
-      privateKey: loadPrivateKey(identityFile),
-      agentSocket
-    };
-  }
-  if (host.hasOverridePassword) {
-    const password = getOverridePassword(host.id);
-    if (!host.user) throw new Error("Override credential requires a username");
-    return {
-      hostname: host.hostname,
-      port: host.port ?? 22,
-      username: host.user,
-      password: password ?? void 0,
-      identityFile: host.identityFile,
-      privateKey: loadPrivateKey(host.identityFile),
-      agentSocket
-    };
-  }
+// src/features/media/main.ts
+function createMediaPlugin() {
+  const media = new MediaManager();
+  const tracker = new MediaTracker(media);
   return {
-    hostname: host.hostname,
-    port: host.port ?? 22,
-    username: host.user ?? import_os6.default.userInfo().username,
-    identityFile: host.identityFile,
-    privateKey: loadPrivateKey(host.identityFile),
-    agentSocket
+    id: "media",
+    setup(ctx2) {
+      const { ipcMain: ipcMain2 } = ctx2;
+      ipcMain2.handle("media:get-now-playing", async () => media.getAllNowPlaying());
+      ipcMain2.handle("media:control", async (_event, action, bundleId) => media.control(action, bundleId));
+      ipcMain2.handle(
+        "media:list-history",
+        async (_event, limit) => listHistory(typeof limit === "number" ? limit : 50)
+      );
+      ipcMain2.handle("media:stats", async () => getStats());
+      ipcMain2.handle("media:clear-history", async () => {
+        await clearHistory();
+        return true;
+      });
+      ipcMain2.handle("media:clear-all-stats", async () => {
+        await clearAllStats();
+        return true;
+      });
+      ipcMain2.handle(
+        "media:list-artists",
+        async (_event, limit) => listArtistGroups(typeof limit === "number" ? limit : 30)
+      );
+    },
+    async start() {
+      await purgeOldHistory();
+      tracker.start();
+    },
+    async dispose() {
+      await tracker.stop();
+    }
   };
 }
 
-// src/electron/sftp-manager.ts
-var SftpManager = class {
-  sessions = /* @__PURE__ */ new Map();
-  async connect(host) {
-    const creds = resolveCredentials(host);
-    const resolved = await resolveHost(creds.hostname);
-    if (resolved.via === "unresolved") {
-      throw new Error(
-        `Could not resolve ${creds.hostname}. For Tailscale, try the 100.x.x.x IP or full .ts.net name.`
-      );
-    }
-    try {
-      await tcpPreflight(resolved.address, creds.port, 8e3);
-    } catch (err) {
-      const detail = err instanceof Error ? err.message : String(err);
-      throw new Error(
-        `${detail}. Tailscale tunnel up? Try \`tailscale ping ${creds.hostname}\`.`
-      );
-    }
-    const client = new import_ssh22.Client();
-    const ready = new Promise((resolve, reject) => {
-      client.once("ready", () => resolve());
-      client.once("error", (err) => reject(err));
-    });
-    client.connect({
-      host: resolved.address,
-      port: creds.port,
-      username: creds.username,
-      password: creds.password,
-      privateKey: creds.privateKey,
-      agent: creds.agentSocket,
-      tryKeyboard: false,
-      readyTimeout: 15e3,
-      keepaliveInterval: 3e4
-    });
-    await ready;
-    const sftp = await new Promise((resolve, reject) => {
-      client.sftp((err, wrapper) => err ? reject(err) : resolve(wrapper));
-    });
-    const homePath = await new Promise((resolve) => {
-      sftp.realpath(".", (err, resolved2) => {
-        if (err || !resolved2) resolve("/");
-        else resolve(resolved2);
-      });
-    });
-    const id = (0, import_crypto3.randomUUID)();
-    this.sessions.set(id, { id, hostId: host.id, client, sftp, homePath });
-    client.on("close", () => {
-      this.sessions.delete(id);
-    });
-    return { sessionId: id, homePath };
-  }
-  async list(sessionId, dirPath) {
-    const session = this.requireSession(sessionId);
-    const target = dirPath || session.homePath;
-    const resolved = await new Promise((resolve, reject) => {
-      session.sftp.realpath(target, (err, value) => err ? reject(err) : resolve(value));
-    });
-    const entries = await new Promise((resolve, reject) => {
-      session.sftp.readdir(resolved, (err, list) => err ? reject(err) : resolve(list));
-    });
-    return entries.filter((entry) => entry.filename !== "." && entry.filename !== "..").map((entry) => ({
-      name: entry.filename,
-      path: posixJoin(resolved, entry.filename),
-      isDir: entry.attrs.isDirectory(),
-      isLink: entry.attrs.isSymbolicLink(),
-      size: entry.attrs.size ?? 0,
-      mtimeMs: (entry.attrs.mtime ?? 0) * 1e3
-    })).sort(compareEntries);
-  }
-  async mkdir(sessionId, dirPath) {
-    const session = this.requireSession(sessionId);
-    await new Promise((resolve, reject) => {
-      session.sftp.mkdir(dirPath, (err) => err ? reject(err) : resolve());
-    });
-  }
-  async remove(sessionId, targetPath, isDir) {
-    const session = this.requireSession(sessionId);
-    await new Promise((resolve, reject) => {
-      const op = isDir ? session.sftp.rmdir.bind(session.sftp) : session.sftp.unlink.bind(session.sftp);
-      op(targetPath, (err) => err ? reject(err) : resolve());
-    });
-  }
-  disconnect(sessionId) {
-    const session = this.sessions.get(sessionId);
-    if (!session) return false;
-    try {
-      session.client.end();
-    } catch {
-    }
-    this.sessions.delete(sessionId);
-    return true;
-  }
-  dispose() {
-    for (const session of this.sessions.values()) {
-      try {
-        session.client.end();
-      } catch {
-      }
-    }
-    this.sessions.clear();
-  }
-  requireSession(sessionId) {
-    const session = this.sessions.get(sessionId);
-    if (!session) throw new Error(`SFTP session ${sessionId} not found`);
-    return session;
-  }
-};
-function posixJoin(dir, name) {
-  if (dir.endsWith("/")) return `${dir}${name}`;
-  return `${dir}/${name}`;
-}
-function compareEntries(a, b) {
-  if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
-  return a.name.localeCompare(b.name, void 0, { sensitivity: "base" });
-}
+// src/features/main-plugins.js
+var mainPlugins = [createBluetoothPlugin(), createDockerPlugin(), createMediaPlugin()];
 
-// src/electron/rsync-manager.ts
-var import_child_process7 = require("child_process");
-var import_crypto4 = require("crypto");
-var import_events4 = require("events");
-var import_os7 = __toESM(require("os"), 1);
-var import_path10 = __toESM(require("path"), 1);
-var PROGRESS_LINE = /([\d,]+)\s+(\d+)%\s+([\d.]+\S+)\s+(\d+:\d{2}:\d{2})/;
-function expandHome3(filePath) {
-  if (filePath.startsWith("~/")) return import_path10.default.join(import_os7.default.homedir(), filePath.slice(2));
-  if (filePath === "~") return import_os7.default.homedir();
-  return filePath;
-}
-function buildSshFlag(creds, usingPassword) {
-  const parts = ["ssh", "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=15"];
-  if (!usingPassword) parts.push("-o", "BatchMode=yes");
-  if (creds.port && creds.port !== 22) parts.push("-p", String(creds.port));
-  if (creds.identityFile) parts.push("-i", expandHome3(creds.identityFile));
-  return parts.join(" ");
-}
-function detectSshpass() {
-  try {
-    (0, import_child_process7.execFileSync)("which", ["sshpass"], { stdio: ["ignore", "pipe", "ignore"] });
-    return true;
-  } catch {
-    return false;
-  }
-}
-function detectRsyncMajor() {
-  try {
-    const output = (0, import_child_process7.execFileSync)("rsync", ["--version"], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"]
-    });
-    const match = output.match(/version\s+(\d+)\./);
-    return match ? Number(match[1]) : 0;
-  } catch {
-    return 0;
-  }
-}
-function shellQuote(value) {
-  return `'${value.replace(/'/g, `'\\''`)}'`;
-}
-var RsyncManager = class extends import_events4.EventEmitter {
-  transfers = /* @__PURE__ */ new Map();
-  sshpassAvailable = null;
-  rsyncMajor = null;
-  isSshpassAvailable() {
-    if (this.sshpassAvailable === null) {
-      this.sshpassAvailable = detectSshpass();
-    }
-    return this.sshpassAvailable;
-  }
-  getRsyncMajor() {
-    if (this.rsyncMajor === null) {
-      this.rsyncMajor = detectRsyncMajor();
-    }
-    return this.rsyncMajor;
-  }
-  list() {
-    return Array.from(this.transfers.values()).map(stripInternal);
-  }
-  async start(host, options) {
-    const creds = resolveCredentials(host);
-    const usingPassword = Boolean(creds.password);
-    if (usingPassword && !this.isSshpassAvailable()) {
-      throw new Error(
-        "This host needs a password, but sshpass is not installed. Install it via `brew install hudochenkov/sshpass/sshpass` or switch to key auth."
-      );
-    }
-    const id = (0, import_crypto4.randomUUID)();
-    const sshFlag = buildSshFlag(creds, usingPassword);
-    const modernRsync = this.getRsyncMajor() >= 3;
-    const remoteSpec = modernRsync ? `${creds.username}@${creds.hostname}:${options.remotePath}` : `${creds.username}@${creds.hostname}:${shellQuote(options.remotePath)}`;
-    const rsyncArgs = ["-a"];
-    if (modernRsync) {
-      rsyncArgs.push("--info=progress2", "--protect-args");
-    } else {
-      rsyncArgs.push("--progress");
-    }
-    rsyncArgs.push("--partial", "-e", sshFlag);
-    if (options.compress) rsyncArgs.push("--compress");
-    if (options.mirror) rsyncArgs.push("--delete");
-    if (options.dryRun) rsyncArgs.push("--dry-run");
-    if (options.direction === "upload") {
-      rsyncArgs.push(options.localPath, remoteSpec);
-    } else {
-      rsyncArgs.push(remoteSpec, options.localPath);
-    }
-    let command;
-    let args;
-    let env = { ...process.env };
-    if (usingPassword) {
-      command = "sshpass";
-      args = ["-e", "rsync", ...rsyncArgs];
-      env = { ...env, SSHPASS: creds.password };
-    } else {
-      command = "rsync";
-      args = rsyncArgs;
-    }
-    const child = (0, import_child_process7.spawn)(command, args, { env });
-    const transfer = {
-      id,
-      hostId: host.id,
-      hostAlias: host.alias,
-      direction: options.direction,
-      localPath: options.localPath,
-      remotePath: options.remotePath,
-      options,
-      state: "running",
-      bytesTransferred: 0,
-      percent: 0,
-      bytesPerSecond: 0,
-      eta: "",
-      log: [],
-      stderr: "",
-      command: `${command} ${args.join(" ")}`,
-      startedAt: Date.now(),
-      process: child,
-      stdoutBuffer: ""
-    };
-    this.transfers.set(id, transfer);
-    this.emit("progress", stripInternal(transfer));
-    child.stdout?.on("data", (chunk) => this.handleStdout(transfer, chunk));
-    child.stderr?.on("data", (chunk) => this.handleStderr(transfer, chunk));
-    child.on("error", (err) => {
-      transfer.state = "error";
-      transfer.error = err.message;
-      transfer.finishedAt = Date.now();
-      this.emit("done", stripInternal(transfer));
-      this.transfers.delete(id);
-    });
-    child.on("close", (code) => {
-      if (transfer.state === "cancelled") {
-        transfer.finishedAt = Date.now();
-        transfer.exitCode = code ?? void 0;
-        this.emit("done", stripInternal(transfer));
-        this.transfers.delete(id);
-        return;
-      }
-      transfer.exitCode = code ?? void 0;
-      transfer.finishedAt = Date.now();
-      if (code === 0) {
-        transfer.state = "done";
-        transfer.percent = 100;
-      } else {
-        transfer.state = "error";
-        transfer.error = transfer.stderr.trim() || `rsync exited with code ${code}`;
-      }
-      this.emit("done", stripInternal(transfer));
-      this.transfers.delete(id);
-    });
-    return { transferId: id };
-  }
-  cancel(transferId) {
-    const transfer = this.transfers.get(transferId);
-    if (!transfer) return false;
-    transfer.state = "cancelled";
-    try {
-      transfer.process.kill("SIGINT");
-    } catch {
-    }
-    setTimeout(() => {
-      const stale = this.transfers.get(transferId);
-      if (stale && !stale.process.killed) {
-        try {
-          stale.process.kill("SIGKILL");
-        } catch {
-        }
-      }
-    }, 2e3);
-    return true;
-  }
-  dispose() {
-    for (const transfer of this.transfers.values()) {
-      try {
-        transfer.process.kill("SIGKILL");
-      } catch {
-      }
-    }
-    this.transfers.clear();
-  }
-  handleStdout(transfer, chunk) {
-    transfer.stdoutBuffer += chunk.toString("utf8");
-    const segments = transfer.stdoutBuffer.split(/[\r\n]+/);
-    transfer.stdoutBuffer = segments.pop() ?? "";
-    for (const segment of segments) {
-      const trimmed = segment.trim();
-      if (!trimmed) continue;
-      const match = trimmed.match(PROGRESS_LINE);
-      if (match) {
-        transfer.bytesTransferred = Number(match[1].replace(/,/g, ""));
-        transfer.percent = Number(match[2]);
-        transfer.bytesPerSecond = parseRate(match[3]);
-        transfer.eta = match[4];
-        this.emit("progress", stripInternal(transfer));
-      } else {
-        transfer.log.push(trimmed);
-        if (transfer.log.length > 50) transfer.log.shift();
-      }
-    }
-  }
-  handleStderr(transfer, chunk) {
-    transfer.stderr += chunk.toString("utf8");
-    if (transfer.stderr.length > 4e3) {
-      transfer.stderr = transfer.stderr.slice(-4e3);
-    }
-    this.emit("progress", stripInternal(transfer));
-  }
-};
-function stripInternal(transfer) {
-  const { process: _process, stdoutBuffer: _stdout, ...rest } = transfer;
-  return rest;
-}
-function parseRate(token) {
-  const match = token.match(/^([\d.]+)([kMG]?B)\/s$/);
-  if (!match) return 0;
-  const value = Number(match[1]);
-  const unit = match[2];
-  const multiplier = unit === "GB" ? 1024 ** 3 : unit === "MB" ? 1024 ** 2 : unit === "kB" ? 1024 : 1;
-  return value * multiplier;
-}
+// src/plugin/external-main.js
+var import_fs8 = require("fs");
+var import_promises7 = require("fs/promises");
+var import_path12 = __toESM(require("path"), 1);
+var import_url4 = require("url");
 
-// src/electron/rdp-hosts.ts
-var rowToHost2 = (row) => ({
-  id: row.id,
-  label: row.label,
-  hostname: row.hostname,
-  port: row.port,
-  username: row.username,
-  hasPassword: Boolean(row.password_encrypted && row.password_encrypted.length > 0),
-  domain: row.domain ?? void 0,
-  color: row.color ?? void 0,
-  notes: row.notes ?? void 0,
-  extraArgs: row.extra_args ?? void 0,
-  createdAt: row.created_at,
-  updatedAt: row.updated_at
-});
-var selectAll2 = `
-    SELECT id, label, hostname, port, username, password_encrypted,
-           domain, color, notes, extra_args, created_at, updated_at
-    FROM rdp_hosts
-    ORDER BY label COLLATE NOCASE ASC
-`;
-var selectById2 = `
-    SELECT id, label, hostname, port, username, password_encrypted,
-           domain, color, notes, extra_args, created_at, updated_at
-    FROM rdp_hosts WHERE id = $id
-`;
-function rowsFromStmt2(sql, params = []) {
-  const db2 = getDb();
-  const stmt = db2.prepare(sql);
-  try {
-    stmt.bind(params);
-    const result = [];
-    while (stmt.step()) {
-      result.push(stmt.getAsObject());
-    }
-    return result;
-  } finally {
-    stmt.free();
+// src/plugin/manifest.ts
+var ID_RE = /^[a-z0-9][a-z0-9-]*$/;
+function validateManifest(raw) {
+  const errors = [];
+  if (typeof raw !== "object" || raw === null) {
+    return { ok: false, errors: ["plugin.json must be a JSON object"] };
   }
-}
-function listRdpHosts() {
-  return rowsFromStmt2(selectAll2).map(rowToHost2);
-}
-function getRdpHost(id) {
-  const rows = rowsFromStmt2(selectById2, { $id: id });
-  return rows[0] ? rowToHost2(rows[0]) : null;
-}
-function getRdpHostPassword(id) {
-  const rows = rowsFromStmt2(selectById2, { $id: id });
-  if (!rows[0]) return null;
-  const blob = rows[0].password_encrypted;
-  if (!blob) return null;
-  return decryptPassword(Buffer.from(blob));
-}
-async function createRdpHost(input) {
-  const db2 = getDb();
-  const now = Date.now();
-  const encrypted = input.password ? encryptPassword(input.password) : null;
-  const port = input.port ?? 3389;
-  db2.run(
-    `INSERT INTO rdp_hosts
-            (label, hostname, port, username, password_encrypted, domain, color, notes, extra_args, created_at, updated_at)
-         VALUES ($label, $hostname, $port, $username, $pwd, $domain, $color, $notes, $extra, $created, $updated)`,
-    {
-      $label: input.label,
-      $hostname: input.hostname,
-      $port: port,
-      $username: input.username,
-      $pwd: encrypted ?? null,
-      $domain: input.domain ?? null,
-      $color: input.color ?? null,
-      $notes: input.notes ?? null,
-      $extra: input.extraArgs ?? null,
-      $created: now,
-      $updated: now
-    }
-  );
-  const result = db2.exec("SELECT last_insert_rowid() AS id");
-  const id = Number(result[0]?.values[0]?.[0] ?? 0);
-  await persist();
-  return getRdpHost(id);
-}
-async function updateRdpHost(id, input) {
-  const db2 = getDb();
-  const now = Date.now();
-  const port = input.port ?? 3389;
-  const shouldUpdatePassword = input.password !== void 0 && input.password !== null;
-  const newEncrypted = shouldUpdatePassword && input.password !== "" ? encryptPassword(input.password) : null;
-  if (shouldUpdatePassword) {
-    db2.run(
-      `UPDATE rdp_hosts SET
-                label=$label, hostname=$hostname, port=$port, username=$username,
-                password_encrypted=$pwd, domain=$domain, color=$color, notes=$notes,
-                extra_args=$extra, updated_at=$updated
-             WHERE id=$id`,
-      {
-        $id: id,
-        $label: input.label,
-        $hostname: input.hostname,
-        $port: port,
-        $username: input.username,
-        $pwd: newEncrypted ?? null,
-        $domain: input.domain ?? null,
-        $color: input.color ?? null,
-        $notes: input.notes ?? null,
-        $extra: input.extraArgs ?? null,
-        $updated: now
-      }
-    );
+  const obj = raw;
+  if (typeof obj.id !== "string" || !ID_RE.test(obj.id)) {
+    errors.push("id must be a lowercase slug (a-z, 0-9, hyphen)");
+  }
+  if (typeof obj.name !== "string" || obj.name.trim() === "") {
+    errors.push("name is required");
+  }
+  if (typeof obj.version !== "string" || obj.version.trim() === "") {
+    errors.push("version is required");
+  }
+  if (obj.description !== void 0 && typeof obj.description !== "string") {
+    errors.push("description must be a string");
+  }
+  if (obj.icon !== void 0 && typeof obj.icon !== "string") {
+    errors.push("icon must be a string (lucide icon name)");
+  }
+  const caps = obj.capabilities;
+  if (typeof caps !== "object" || caps === null) {
+    errors.push("capabilities is required");
   } else {
-    db2.run(
-      `UPDATE rdp_hosts SET
-                label=$label, hostname=$hostname, port=$port, username=$username,
-                domain=$domain, color=$color, notes=$notes,
-                extra_args=$extra, updated_at=$updated
-             WHERE id=$id`,
-      {
-        $id: id,
-        $label: input.label,
-        $hostname: input.hostname,
-        $port: port,
-        $username: input.username,
-        $domain: input.domain ?? null,
-        $color: input.color ?? null,
-        $notes: input.notes ?? null,
-        $extra: input.extraArgs ?? null,
-        $updated: now
-      }
-    );
+    const c = caps;
+    if (c.main !== void 0 && typeof c.main !== "string") errors.push("capabilities.main must be a path string");
+    if (c.renderer !== void 0 && typeof c.renderer !== "string") errors.push("capabilities.renderer must be a path string");
+    if (!c.main && !c.renderer) errors.push("plugin must declare capabilities.main and/or capabilities.renderer");
   }
-  await persist();
-  return getRdpHost(id);
-}
-async function deleteRdpHost(id) {
-  const db2 = getDb();
-  db2.run("DELETE FROM rdp_hosts WHERE id = $id", { $id: id });
-  await persist();
-  return true;
+  if (errors.length > 0) return { ok: false, errors };
+  return { ok: true, errors: [], manifest: obj };
 }
 
-// src/electron/rdp-manager.ts
-var import_child_process8 = require("child_process");
-var import_crypto5 = require("crypto");
-var import_events5 = require("events");
-function detectBinary() {
-  for (const candidate of ["sdl-freerdp3", "sdl-freerdp", "xfreerdp3", "xfreerdp"]) {
-    try {
-      (0, import_child_process8.execFileSync)("which", [candidate], { stdio: ["ignore", "pipe", "ignore"] });
-      return candidate;
-    } catch {
-    }
-  }
-  return null;
+// src/plugin/external-main.js
+function pluginsDir(userDataPath) {
+  return import_path12.default.join(userDataPath, "plugins");
 }
-var RdpManager = class extends import_events5.EventEmitter {
-  sessions = /* @__PURE__ */ new Map();
-  binary;
-  getBinary() {
-    if (this.binary === void 0) {
-      this.binary = detectBinary();
-    }
-    return this.binary;
-  }
-  isAvailable() {
-    return this.getBinary() !== null;
-  }
-  list() {
-    return Array.from(this.sessions.values()).map((session) => ({
-      id: session.id,
-      hostId: session.hostId,
-      label: session.label,
-      hostname: session.hostname,
-      port: session.port,
-      pid: session.pid,
-      startedAt: session.startedAt
-    }));
-  }
-  async connect(hostId) {
-    const binary = this.getBinary();
-    if (!binary) {
-      throw new Error(
-        "xfreerdp is not installed. Run `brew install freerdp` and restart the app."
-      );
-    }
-    const host = getRdpHost(hostId);
-    if (!host) throw new Error(`RDP host ${hostId} not found`);
-    const password = getRdpHostPassword(hostId);
-    const args = buildArgs(host, password);
-    const child = (0, import_child_process8.spawn)(binary, args, {
-      detached: true,
-      stdio: ["ignore", "ignore", "pipe"]
-    });
-    if (typeof child.unref === "function") child.unref();
-    const id = (0, import_crypto5.randomUUID)();
-    const session = {
-      id,
-      hostId: host.id,
-      label: host.label,
-      hostname: host.hostname,
-      port: host.port,
-      pid: child.pid ?? -1,
-      startedAt: Date.now(),
-      process: child,
-      stderrBuffer: ""
-    };
-    this.sessions.set(id, session);
-    this.emit("active-changed", this.list());
-    child.stderr?.on("data", (chunk) => {
-      session.stderrBuffer += chunk.toString("utf8");
-      if (session.stderrBuffer.length > 4e3) {
-        session.stderrBuffer = session.stderrBuffer.slice(-4e3);
-      }
-    });
-    child.on("error", (err) => {
-      this.sessions.delete(id);
-      this.emit("active-changed", this.list());
-      this.emit("exit", {
-        sessionId: id,
-        hostId: host.id,
-        error: err.message,
-        stderr: session.stderrBuffer
-      });
-    });
-    child.on("close", (code) => {
-      this.sessions.delete(id);
-      this.emit("active-changed", this.list());
-      this.emit("exit", {
-        sessionId: id,
-        hostId: host.id,
-        exitCode: code,
-        stderr: session.stderrBuffer
-      });
-    });
-    return { sessionId: id };
-  }
-  disconnect(sessionId) {
-    const session = this.sessions.get(sessionId);
-    if (!session) return false;
-    try {
-      session.process.kill("SIGTERM");
-    } catch {
-    }
-    setTimeout(() => {
-      if (this.sessions.has(sessionId)) {
-        try {
-          session.process.kill("SIGKILL");
-        } catch {
-        }
-      }
-    }, 2e3);
-    return true;
-  }
-  dispose() {
-    for (const session of this.sessions.values()) {
-      try {
-        session.process.kill("SIGTERM");
-      } catch {
-      }
-    }
-    this.sessions.clear();
-  }
-};
-function buildArgs(host, password) {
-  const args = [];
-  args.push(`/v:${host.hostname}:${host.port}`);
-  args.push(`/u:${host.username}`);
-  if (host.domain) args.push(`/d:${host.domain}`);
-  if (password) args.push(`/p:${password}`);
-  args.push("/cert:ignore", "+clipboard", "/dynamic-resolution");
-  if (host.extraArgs) {
-    const tokens = host.extraArgs.split(/\s+/).map((token) => token.trim()).filter(Boolean);
-    args.push(...tokens);
-  }
-  return args;
-}
-
-// src/electron/disk-scanner.ts
-var import_fs7 = require("fs");
-var import_promises6 = require("fs/promises");
-var import_path11 = __toESM(require("path"), 1);
-var import_events6 = require("events");
-var SKIP_BASENAMES = /* @__PURE__ */ new Set([
-  ".Spotlight-V100",
-  ".Trashes",
-  ".fseventsd",
-  ".DocumentRevisions-V100",
-  ".TemporaryItems",
-  ".MobileBackups",
-  ".PKInstallSandboxManager",
-  ".HFS+ Private Directory Data"
-]);
-var SKIP_PATH_PREFIXES = [
-  "/dev",
-  "/Volumes",
-  "/private/var/folders",
-  "/.vol",
-  "/System/Volumes/VM",
-  "/System/Volumes/Preboot",
-  "/System/Volumes/Update"
-];
-var SKIP_PATH_CONTAINS = [
-  "/Library/Mobile Documents",
-  "/.MobileBackups",
-  "/.PreviousSystemInformation",
-  "/Library/Application Support/MobileSync",
-  "/Library/CloudStorage"
-];
-function shouldSkip(filePath, basename) {
-  if (SKIP_BASENAMES.has(basename)) return true;
-  for (const prefix of SKIP_PATH_PREFIXES) {
-    if (filePath === prefix || filePath.startsWith(prefix + "/")) return true;
-  }
-  for (const fragment of SKIP_PATH_CONTAINS) {
-    if (filePath.includes(fragment)) return true;
-  }
-  return false;
-}
-var KEEP_DEPTH = 12;
-var PROGRESS_EVERY_PATHS = 250;
-var FS_TIMEOUT_MS = 5e3;
-var MAX_CONCURRENT_FS = 32;
-var Semaphore = class {
-  active = 0;
-  waiters = [];
-  max;
-  constructor(max) {
-    this.max = max;
-  }
-  async acquire() {
-    if (this.active >= this.max) {
-      await new Promise((resolve) => this.waiters.push(resolve));
-    }
-    this.active += 1;
-  }
-  release() {
-    this.active -= 1;
-    const next = this.waiters.shift();
-    if (next) next();
-  }
-};
-async function withTimeout(promise, ms) {
-  let timer;
+async function readPluginDir(dir) {
+  const manifestPath = import_path12.default.join(dir, "plugin.json");
+  if (!(0, import_fs8.existsSync)(manifestPath)) return { dir, errors: ["plugin.json is missing"] };
+  let parsed;
   try {
-    return await Promise.race([
-      promise,
-      new Promise((resolve) => {
-        timer = setTimeout(() => resolve(null), ms);
-      })
-    ]);
-  } finally {
-    if (timer) clearTimeout(timer);
+    parsed = JSON.parse(await (0, import_promises7.readFile)(manifestPath, "utf8"));
+  } catch {
+    return { dir, errors: ["plugin.json is not valid JSON"] };
   }
+  const result = validateManifest(parsed);
+  if (!result.ok) return { dir, errors: result.errors };
+  const manifest = result.manifest;
+  const fileErrors = [];
+  if (manifest.capabilities.main && !(0, import_fs8.existsSync)(import_path12.default.join(dir, manifest.capabilities.main))) {
+    fileErrors.push(`main entry not found: ${manifest.capabilities.main}`);
+  }
+  if (manifest.capabilities.renderer && !(0, import_fs8.existsSync)(import_path12.default.join(dir, manifest.capabilities.renderer))) {
+    fileErrors.push(`renderer entry not found: ${manifest.capabilities.renderer}`);
+  }
+  if (fileErrors.length > 0) return { dir, errors: fileErrors };
+  try {
+    const meta = JSON.parse(await (0, import_promises7.readFile)(import_path12.default.join(dir, ".installed.json"), "utf8"));
+    if (typeof meta.source === "string") manifest.source = meta.source;
+  } catch {
+  }
+  return { dir, manifest };
 }
-function emitProgress(ctx) {
-  ctx.emitter.emit("progress", {
-    pathsSeen: ctx.pathsSeen,
-    bytesSoFar: ctx.bytesSoFar
+async function discoverPlugins(baseDir) {
+  if (!(0, import_fs8.existsSync)(baseDir)) return [];
+  const out = [];
+  for (const entry of await (0, import_promises7.readdir)(baseDir, { withFileTypes: true })) {
+    if (!entry.isDirectory() || entry.name.startsWith(".")) continue;
+    const res = await readPluginDir(import_path12.default.join(baseDir, entry.name));
+    if (res.manifest) out.push(res);
+  }
+  return out;
+}
+async function loadExternalMainPlugin(dir, manifest) {
+  if (!manifest.capabilities.main) return null;
+  const mainPath = import_path12.default.join(dir, manifest.capabilities.main);
+  const url = `${(0, import_url4.pathToFileURL)(mainPath).href}?t=${Date.now()}`;
+  const mod = await import(url);
+  const factory = mod.createPlugin ?? mod.default;
+  const plugin = typeof factory === "function" ? factory() : factory;
+  if (!plugin || typeof plugin.setup !== "function") {
+    throw new Error(`plugin "${manifest.id}" main entry must export createPlugin() returning { setup }`);
+  }
+  plugin.id = manifest.id;
+  return plugin;
+}
+
+// src/plugin/installer.js
+var import_fs9 = require("fs");
+var import_promises8 = require("fs/promises");
+var import_path13 = __toESM(require("path"), 1);
+var import_child_process8 = require("child_process");
+var CLONE_TIMEOUT_MS = 6e4;
+function runGit(args, cwd) {
+  return new Promise((resolve, reject) => {
+    const proc = (0, import_child_process8.spawn)("git", args, { cwd, env: process.env });
+    let stderr = "";
+    proc.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+    const timer = setTimeout(() => {
+      proc.kill("SIGKILL");
+      reject(new Error("git clone timed out"));
+    }, CLONE_TIMEOUT_MS);
+    proc.on("error", (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+    proc.on("close", (code) => {
+      clearTimeout(timer);
+      if (code === 0) resolve();
+      else reject(new Error(stderr.trim() || `git exited with code ${code}`));
+    });
   });
 }
-var CancelledError = class extends Error {
-  constructor() {
-    super("cancelled");
-    this.name = "CancelledError";
-  }
-};
-async function walk(dirPath, depth, ctx) {
-  if (ctx.cancelled.value) throw new CancelledError();
-  const baseName = import_path11.default.basename(dirPath) || dirPath;
-  if (depth > 0 && shouldSkip(dirPath, baseName)) {
-    return { name: baseName, path: dirPath, size: 0, isDir: true };
-  }
-  ctx.pathsSeen += 1;
-  if (ctx.pathsSeen % PROGRESS_EVERY_PATHS === 0) emitProgress(ctx);
-  let filesBytes = 0;
-  const subdirPaths = [];
-  await ctx.sem.acquire();
+async function installPlugin(gitUrl, baseDir, existingIds) {
+  await (0, import_promises8.mkdir)(baseDir, { recursive: true });
+  const tmp = import_path13.default.join(baseDir, `.tmp-${Date.now()}`);
   try {
-    const dir = await withTimeout((0, import_promises6.opendir)(dirPath), FS_TIMEOUT_MS);
-    if (!dir) {
-      return { name: baseName, path: dirPath, size: 0, isDir: true };
-    }
-    try {
-      for await (const entry of dir) {
-        if (ctx.cancelled.value) break;
-        if (entry.isSymbolicLink()) continue;
-        const full = import_path11.default.join(dirPath, entry.name);
-        if (shouldSkip(full, entry.name)) continue;
-        if (entry.isDirectory()) {
-          subdirPaths.push(full);
-        } else if (entry.isFile()) {
-          const stats = await withTimeout((0, import_promises6.lstat)(full), FS_TIMEOUT_MS);
-          if (stats) {
-            filesBytes += stats.size;
-            ctx.bytesSoFar += stats.size;
-          }
-        }
-      }
-    } catch {
-    }
-  } catch {
-  } finally {
-    ctx.sem.release();
+    await runGit(["clone", "--depth", "1", gitUrl, tmp], baseDir);
+  } catch (err) {
+    await (0, import_promises8.rm)(tmp, { recursive: true, force: true });
+    return { ok: false, errors: [`clone failed: ${err.message}`] };
   }
-  if (ctx.cancelled.value) throw new CancelledError();
-  const children2 = await Promise.all(
-    subdirPaths.map((p) => walk(p, depth + 1, ctx))
-  );
-  const subSize = children2.reduce((sum, child) => sum + child.size, 0);
-  const totalSize = filesBytes + subSize;
-  if (depth >= KEEP_DEPTH) {
-    return { name: baseName, path: dirPath, size: totalSize, isDir: true };
+  const res = await readPluginDir(tmp);
+  if (!res.manifest) {
+    await (0, import_promises8.rm)(tmp, { recursive: true, force: true });
+    return { ok: false, errors: res.errors };
   }
-  const kept = children2.filter((child) => child.size > 0);
-  if (filesBytes > 0) {
-    kept.push({
-      name: "(files)",
-      path: `${dirPath}/.files`,
-      size: filesBytes,
-      isDir: false
-    });
+  const manifest = res.manifest;
+  if (existingIds.includes(manifest.id)) {
+    await (0, import_promises8.rm)(tmp, { recursive: true, force: true });
+    return { ok: false, errors: [`a plugin with id "${manifest.id}" is already installed or built-in`] };
   }
-  kept.sort((a, b) => b.size - a.size);
-  return {
-    name: baseName,
-    path: dirPath,
-    size: totalSize,
-    isDir: true,
-    children: kept
-  };
+  const dest = import_path13.default.join(baseDir, manifest.id);
+  if ((0, import_fs9.existsSync)(dest)) await (0, import_promises8.rm)(dest, { recursive: true, force: true });
+  await (0, import_promises8.rename)(tmp, dest);
+  manifest.source = gitUrl;
+  await (0, import_promises8.writeFile)(import_path13.default.join(dest, ".installed.json"), JSON.stringify({ source: gitUrl, installedAt: Date.now() }, null, 2));
+  return { ok: true, manifest, dir: dest };
 }
-var DiskScanner = class extends import_events6.EventEmitter {
-  currentCancel = null;
-  isScanning() {
-    return this.currentCancel !== null;
-  }
-  cancel() {
-    if (this.currentCancel) this.currentCancel.value = true;
-    this.currentCancel = null;
-  }
-  resolveRoot(requested) {
-    if (!requested || requested === "/") {
-      if ((0, import_fs7.existsSync)("/System/Volumes/Data")) return "/System/Volumes/Data";
-    }
-    return requested;
-  }
-  async scan(rootPath) {
-    this.cancel();
-    const resolvedRoot = this.resolveRoot(rootPath);
-    const cancelled = { value: false };
-    this.currentCancel = cancelled;
-    const ctx = {
-      sem: new Semaphore(MAX_CONCURRENT_FS),
-      cancelled,
-      pathsSeen: 0,
-      bytesSoFar: 0,
-      emitter: this
-    };
-    try {
-      const tree = await walk(resolvedRoot, 0, ctx);
-      emitProgress(ctx);
-      return tree;
-    } catch (err) {
-      if (err instanceof CancelledError) return null;
-      throw err;
-    } finally {
-      if (this.currentCancel === cancelled) this.currentCancel = null;
-    }
-  }
-};
+async function uninstallPlugin(id, baseDir) {
+  await (0, import_promises8.rm)(import_path13.default.join(baseDir, id), { recursive: true, force: true });
+}
 
 // main.js
 var EXTRA_PATHS = [
@@ -14819,41 +14930,34 @@ var EXTRA_PATHS = [
   "/opt/homebrew/sbin",
   "/usr/local/bin",
   "/usr/local/sbin",
-  import_path12.default.join(import_os8.default.homedir(), ".docker/bin"),
+  import_path14.default.join(import_os8.default.homedir(), ".docker/bin"),
   "/Applications/Docker.app/Contents/Resources/bin"
 ];
 process.env.PATH = [...EXTRA_PATHS, process.env.PATH ?? ""].filter(Boolean).join(":");
 if (!process.env.UV_THREADPOOL_SIZE) {
   process.env.UV_THREADPOOL_SIZE = "32";
 }
-var __dirname2 = import_path12.default.dirname((0, import_url2.fileURLToPath)(__cjs_meta_url));
+var __dirname2 = import_path14.default.dirname((0, import_url5.fileURLToPath)(__cjs_meta_url));
 var devServerUrl = process.env.VITE_DEV_SERVER_URL;
 var isDev = Boolean(devServerUrl);
-var preloadPath = import_electron5.app.isPackaged ? import_path12.default.join(__dirname2, "preload.cjs") : import_path12.default.join(__dirname2, "src", "electron", "preload.cjs");
-var rendererIndex = import_electron5.app.isPackaged ? import_path12.default.join(__dirname2, "..", "dist", "index.html") : import_path12.default.join(__dirname2, "dist", "index.html");
+var preloadPath = import_electron5.app.isPackaged ? import_path14.default.join(__dirname2, "preload.cjs") : import_path14.default.join(__dirname2, "src", "electron", "preload.cjs");
+var rendererIndex = import_electron5.app.isPackaged ? import_path14.default.join(__dirname2, "..", "dist", "index.html") : import_path14.default.join(__dirname2, "dist", "index.html");
 var mainWindow;
 var popupWindow;
 var tray;
 var isQuitting = false;
-var bluetoothManager;
 var registeredHotkey = null;
 var hotkeyError = null;
 var POPUP_WIDTH = 380;
 var POPUP_HEIGHT = 560;
-var mediaManager = new MediaManager();
 var systemMonitor = new SystemMonitor();
-var mediaTracker = new MediaTracker(mediaManager);
 var sshManager = new SshManager();
-var dockerManager = new DockerManager();
 var sftpManager = new SftpManager();
 var rsyncManager = new RsyncManager();
-var rdpManager = new RdpManager();
 var diskScanner = new DiskScanner();
 diskScanner.on("progress", (payload) => broadcast("disk:scan-progress", payload));
 rsyncManager.on("progress", (payload) => broadcast("transfer:progress", payload));
 rsyncManager.on("done", (payload) => broadcast("transfer:done", payload));
-rdpManager.on("active-changed", (payload) => broadcast("rdp:active-changed", payload));
-rdpManager.on("exit", (payload) => broadcast("rdp:session-exit", payload));
 var rendererWindows = /* @__PURE__ */ new Set();
 var detachedSessions = /* @__PURE__ */ new Map();
 function registerRendererWindow(win) {
@@ -14867,6 +14971,25 @@ function broadcast(channel, payload) {
     }
   }
 }
+var pluginCtx = { ipcMain: import_electron5.ipcMain, broadcast };
+var externalPlugins = [];
+var RESERVED_PLUGIN_IDS = ["ssh", "docker", "bluetooth", "system", "disk", "media", "settings"];
+function pluginsBaseDir() {
+  return pluginsDir(import_electron5.app.getPath("userData"));
+}
+function externalPluginInfo(settings) {
+  const disabled = new Set(settings.plugins.disabled);
+  return externalPlugins.map(({ manifest }) => ({
+    id: manifest.id,
+    name: manifest.name,
+    description: manifest.description,
+    icon: manifest.icon,
+    enabled: !disabled.has(manifest.id),
+    external: true,
+    source: manifest.source,
+    hasRenderer: Boolean(manifest.capabilities.renderer)
+  }));
+}
 sshManager.on("data", (payload) => broadcast("ssh:session-data", payload));
 sshManager.on("exit", (payload) => {
   broadcast("ssh:session-exit", payload);
@@ -14876,8 +14999,6 @@ sshManager.on("exit", (payload) => {
   }
   detachedSessions.delete(payload.sessionId);
 });
-dockerManager.on("exec-data", (payload) => broadcast("ssh:session-data", payload));
-dockerManager.on("exec-exit", (payload) => broadcast("ssh:session-exit", payload));
 async function waitForDevServer(url) {
   for (let attempt = 0; attempt < 50; attempt += 1) {
     try {
@@ -15105,77 +15226,6 @@ async function createDetachedWindow(sessionId, hostMeta) {
     sshManager.close(sessionId);
   });
 }
-async function initBluetoothManager() {
-  bluetoothManager = new BluetoothManager();
-  bluetoothManager.on("devices-updated", (devices) => broadcast("bluetooth:devices-updated", devices));
-  bluetoothManager.on("connection-changed", (data) => broadcast("bluetooth:connection-changed", data));
-  bluetoothManager.on("battery-updated", (data) => broadcast("bluetooth:battery-updated", data));
-  bluetoothManager.on("error", (error) => broadcast("bluetooth:error", error));
-  bluetoothManager.on("scan-started", () => broadcast("bluetooth:scan-started"));
-  bluetoothManager.on("scan-completed", () => broadcast("bluetooth:scan-completed"));
-  await bluetoothManager.startMonitoring();
-}
-async function whenBluetoothReady() {
-  if (bluetoothManager) return bluetoothManager;
-  for (let i = 0; i < 50; i += 1) {
-    if (bluetoothManager) return bluetoothManager;
-    await new Promise((resolve) => setTimeout(resolve, 100));
-  }
-  return null;
-}
-import_electron5.ipcMain.handle("bluetooth:get-devices", async () => {
-  const mgr = await whenBluetoothReady();
-  if (!mgr) return { connected: [], notConnected: [], timestamp: Date.now() };
-  return await mgr.getDevices();
-});
-import_electron5.ipcMain.handle("bluetooth:connect-device", async (event, address) => {
-  const mgr = await whenBluetoothReady();
-  if (!mgr) return { success: false, error: "Bluetooth not ready" };
-  return await mgr.connectDevice(address);
-});
-import_electron5.ipcMain.handle("bluetooth:disconnect-device", async (event, address) => {
-  const mgr = await whenBluetoothReady();
-  if (!mgr) return { success: false, error: "Bluetooth not ready" };
-  return await mgr.disconnectDevice(address);
-});
-import_electron5.ipcMain.handle("bluetooth:forget-device", async (event, address) => {
-  const mgr = await whenBluetoothReady();
-  if (!mgr) return { success: false, error: "Bluetooth not ready" };
-  return await mgr.forgetDevice(address);
-});
-import_electron5.ipcMain.handle("bluetooth:scan-devices", async (event, duration = 5) => {
-  const mgr = await whenBluetoothReady();
-  if (!mgr) return { success: false, error: "Bluetooth not ready" };
-  return await mgr.scanForDevices(duration);
-});
-import_electron5.ipcMain.handle("bluetooth:get-battery", async (event, address) => {
-  const mgr = await whenBluetoothReady();
-  if (!mgr) return null;
-  return await mgr.getBatteryLevel(address);
-});
-import_electron5.ipcMain.handle("media:get-now-playing", async () => {
-  return await mediaManager.getAllNowPlaying();
-});
-import_electron5.ipcMain.handle("media:control", async (event, action, bundleId) => {
-  return await mediaManager.control(action, bundleId);
-});
-import_electron5.ipcMain.handle("media:list-history", async (event, limit) => {
-  return listHistory(typeof limit === "number" ? limit : 50);
-});
-import_electron5.ipcMain.handle("media:stats", async () => {
-  return getStats();
-});
-import_electron5.ipcMain.handle("media:clear-history", async () => {
-  await clearHistory();
-  return true;
-});
-import_electron5.ipcMain.handle("media:clear-all-stats", async () => {
-  await clearAllStats();
-  return true;
-});
-import_electron5.ipcMain.handle("media:list-artists", async (event, limit) => {
-  return listArtistGroups(typeof limit === "number" ? limit : 30);
-});
 import_electron5.ipcMain.handle("system:get-metrics", async () => {
   return await systemMonitor.getMetrics();
 });
@@ -15256,21 +15306,15 @@ import_electron5.ipcMain.handle("ssh:delete-forward", async (event, id) => {
   return true;
 });
 import_electron5.ipcMain.handle("ssh:write", async (event, sessionId, data) => {
-  if (dockerManager.ownsExec(sessionId)) {
-    return dockerManager.writeExec(sessionId, data);
-  }
+  if (isRouted(sessionId)) return routeTerminal("write", sessionId, data);
   return sshManager.write(sessionId, data);
 });
 import_electron5.ipcMain.handle("ssh:resize", async (event, sessionId, cols, rows) => {
-  if (dockerManager.ownsExec(sessionId)) {
-    return dockerManager.resizeExec(sessionId, cols, rows);
-  }
+  if (isRouted(sessionId)) return routeTerminal("resize", sessionId, cols, rows);
   return sshManager.resize(sessionId, cols, rows);
 });
 import_electron5.ipcMain.handle("ssh:close-session", async (event, sessionId) => {
-  if (dockerManager.ownsExec(sessionId)) {
-    return dockerManager.closeExec(sessionId);
-  }
+  if (isRouted(sessionId)) return routeTerminal("close", sessionId);
   return sshManager.close(sessionId);
 });
 import_electron5.ipcMain.handle("ssh:list-active", async () => {
@@ -15297,6 +15341,58 @@ import_electron5.ipcMain.handle("settings:update", async (event, patch) => {
   if (patch?.hotkey) applyHotkey(next);
   broadcast("settings:changed", next);
   return next;
+});
+import_electron5.ipcMain.handle("plugins:set-enabled", async (event, id, enabled) => {
+  const current = await loadSettings();
+  const disabled = new Set(current.plugins.disabled);
+  if (enabled) disabled.delete(id);
+  else disabled.add(id);
+  const next = await updateSettings({ plugins: { disabled: [...disabled] } });
+  applyEnabled(next.plugins.disabled);
+  broadcast("settings:changed", next);
+  return next;
+});
+import_electron5.ipcMain.handle("plugins:list", async () => {
+  const settings = await loadSettings();
+  return externalPluginInfo(settings);
+});
+import_electron5.ipcMain.handle("plugins:read-renderer", async (event, id) => {
+  const entry = externalPlugins.find((p) => p.manifest.id === id);
+  if (!entry || !entry.manifest.capabilities.renderer) return null;
+  return await (0, import_promises9.readFile)(import_path14.default.join(entry.dir, entry.manifest.capabilities.renderer), "utf8");
+});
+import_electron5.ipcMain.handle("plugins:install", async (event, gitUrl) => {
+  if (typeof gitUrl !== "string" || !gitUrl.trim()) {
+    return { ok: false, errors: ["Provide a git URL or local path"] };
+  }
+  const existingIds = [...RESERVED_PLUGIN_IDS, ...externalPlugins.map((p) => p.manifest.id)];
+  const result = await installPlugin(gitUrl.trim(), pluginsBaseDir(), existingIds);
+  if (!result.ok) return result;
+  externalPlugins.push({ dir: result.dir, manifest: result.manifest });
+  try {
+    const plugin = await loadExternalMainPlugin(result.dir, result.manifest);
+    if (plugin) registerPlugin(plugin);
+  } catch (err) {
+    logFatal(`load installed plugin ${result.manifest.id}`, err);
+  }
+  const settings = await loadSettings();
+  applyEnabled(settings.plugins.disabled);
+  broadcast("plugins:changed");
+  return { ok: true, manifest: result.manifest };
+});
+import_electron5.ipcMain.handle("plugins:uninstall", async (event, id) => {
+  await unregisterPlugin(id);
+  externalPlugins = externalPlugins.filter((p) => p.manifest.id !== id);
+  await uninstallPlugin(id, pluginsBaseDir());
+  const current = await loadSettings();
+  if (current.plugins.disabled.includes(id)) {
+    const next = await updateSettings({
+      plugins: { disabled: current.plugins.disabled.filter((x) => x !== id) }
+    });
+    broadcast("settings:changed", next);
+  }
+  broadcast("plugins:changed");
+  return true;
 });
 import_electron5.ipcMain.handle("hotkey:status", () => ({
   registered: Boolean(registeredHotkey),
@@ -15339,97 +15435,6 @@ import_electron5.ipcMain.handle("transfer:list", async () => {
 import_electron5.ipcMain.handle("transfer:sshpass-available", async () => {
   return rsyncManager.isSshpassAvailable();
 });
-import_electron5.ipcMain.handle("rdp:list", async () => {
-  return listRdpHosts();
-});
-import_electron5.ipcMain.handle("rdp:create", async (event, input) => {
-  return await createRdpHost(input);
-});
-import_electron5.ipcMain.handle("rdp:update", async (event, id, input) => {
-  return await updateRdpHost(id, input);
-});
-import_electron5.ipcMain.handle("rdp:delete", async (event, id) => {
-  return await deleteRdpHost(id);
-});
-import_electron5.ipcMain.handle("rdp:connect", async (event, hostId) => {
-  return await rdpManager.connect(hostId);
-});
-import_electron5.ipcMain.handle("rdp:disconnect", async (event, sessionId) => {
-  return rdpManager.disconnect(sessionId);
-});
-import_electron5.ipcMain.handle("rdp:list-active", async () => {
-  return rdpManager.list();
-});
-import_electron5.ipcMain.handle("rdp:available", async () => {
-  return { available: rdpManager.isAvailable(), binary: rdpManager.getBinary() };
-});
-import_electron5.ipcMain.handle("docker:status", async () => {
-  return dockerManager.isAvailable();
-});
-import_electron5.ipcMain.handle("docker:list-containers", async () => {
-  return dockerManager.listContainers();
-});
-import_electron5.ipcMain.handle("docker:list-images", async () => {
-  return dockerManager.listImages();
-});
-import_electron5.ipcMain.handle("docker:list-volumes", async () => {
-  return dockerManager.listVolumes();
-});
-import_electron5.ipcMain.handle("docker:list-networks", async () => {
-  return dockerManager.listNetworks();
-});
-import_electron5.ipcMain.handle("docker:run-image", async (event, options) => {
-  return dockerManager.runImage(options);
-});
-import_electron5.ipcMain.handle("docker:start-container", async (event, id) => {
-  await dockerManager.startContainer(id);
-  return true;
-});
-import_electron5.ipcMain.handle("docker:stop-container", async (event, id) => {
-  await dockerManager.stopContainer(id);
-  return true;
-});
-import_electron5.ipcMain.handle("docker:restart-container", async (event, id) => {
-  await dockerManager.restartContainer(id);
-  return true;
-});
-import_electron5.ipcMain.handle("docker:remove-container", async (event, id, force) => {
-  await dockerManager.removeContainer(id, Boolean(force));
-  return true;
-});
-import_electron5.ipcMain.handle("docker:remove-image", async (event, id, force) => {
-  await dockerManager.removeImage(id, Boolean(force));
-  return true;
-});
-import_electron5.ipcMain.handle("docker:remove-volume", async (event, name, force) => {
-  await dockerManager.removeVolume(name, Boolean(force));
-  return true;
-});
-import_electron5.ipcMain.handle("docker:remove-network", async (event, name) => {
-  await dockerManager.removeNetwork(name);
-  return true;
-});
-import_electron5.ipcMain.handle("docker:prune-containers", async () => {
-  return dockerManager.pruneContainers();
-});
-import_electron5.ipcMain.handle("docker:prune-images", async (event, all) => {
-  return dockerManager.pruneImages(Boolean(all));
-});
-import_electron5.ipcMain.handle("docker:prune-volumes", async () => {
-  return dockerManager.pruneVolumes();
-});
-import_electron5.ipcMain.handle("docker:prune-networks", async () => {
-  return dockerManager.pruneNetworks();
-});
-import_electron5.ipcMain.handle("docker:prune-system", async (event, all) => {
-  return dockerManager.pruneSystem(Boolean(all));
-});
-import_electron5.ipcMain.handle("docker:logs", async (event, id, tail) => {
-  return dockerManager.getLogs(id, typeof tail === "number" ? tail : 500);
-});
-import_electron5.ipcMain.handle("docker:exec-start", async (event, containerId, containerName, cols, rows) => {
-  return dockerManager.startExec(containerId, containerName, cols, rows);
-});
 import_electron5.ipcMain.handle("ssh:detach-session", async (event, sessionId, hostMeta) => {
   if (detachedSessions.has(sessionId)) {
     const existing = detachedSessions.get(sessionId);
@@ -15441,10 +15446,10 @@ import_electron5.ipcMain.handle("ssh:detach-session", async (event, sessionId, h
 });
 function logFatal(stage, err) {
   try {
-    const logPath = import_path12.default.join(import_electron5.app.getPath("userData"), "fatal.log");
+    const logPath = import_path14.default.join(import_electron5.app.getPath("userData"), "fatal.log");
     const line = `[${(/* @__PURE__ */ new Date()).toISOString()}] ${stage}: ${err?.stack ?? err}
 `;
-    (0, import_fs8.appendFileSync)(logPath, line);
+    (0, import_fs10.appendFileSync)(logPath, line);
   } catch {
     console.error(stage, err);
   }
@@ -15455,12 +15460,20 @@ import_electron5.app.whenReady().then(async () => {
   try {
     await initDb();
     const settings = await loadSettings();
-    await purgeOldHistory();
+    initPluginManager(mainPlugins, pluginCtx);
+    externalPlugins = await discoverPlugins(pluginsBaseDir());
+    for (const { dir, manifest } of externalPlugins) {
+      try {
+        const plugin = await loadExternalMainPlugin(dir, manifest);
+        if (plugin) registerPlugin(plugin);
+      } catch (err) {
+        logFatal(`load external plugin ${manifest.id}`, err);
+      }
+    }
     await createMainWindow();
     createTray();
     applyHotkey(settings);
-    initBluetoothManager();
-    mediaTracker.start();
+    applyEnabled(settings.plugins.disabled);
   } catch (err) {
     logFatal("whenReady", err);
     throw err;
@@ -15479,16 +15492,11 @@ import_electron5.app.on("window-all-closed", () => {
 });
 import_electron5.app.on("will-quit", async () => {
   import_electron5.globalShortcut.unregisterAll();
-  if (bluetoothManager) {
-    bluetoothManager.stopMonitoring();
-  }
+  await disposeAllPlugins();
   sshManager.dispose();
-  dockerManager.dispose();
   sftpManager.dispose();
   rsyncManager.dispose();
-  rdpManager.dispose();
   diskScanner.cancel();
-  await mediaTracker.stop();
   await closeDb();
 });
 //# sourceMappingURL=main.cjs.map

@@ -1,118 +1,8 @@
 /// <reference types="vite/client" />
 
-interface Device {
-    name: string;
-    address: string;
-    batteryLevel?: number | null;
-    type?: string;
-    vendorId?: string;
-    productId?: string;
-    firmwareVersion?: string;
-    connected: boolean;
-    rssi?: number;
-}
-
-interface DeviceList {
-    connected: Device[];
-    notConnected: Device[];
-}
-
-interface BluetoothActionResult {
-    success: boolean;
-    error?: string;
-}
-
-interface BluetoothBatteryUpdate {
-    address: string;
-    batteryLevel: number | null;
-}
-
-interface BluetoothAPI {
-    getDevices: () => Promise<DeviceList>;
-    connectDevice: (address: string) => Promise<BluetoothActionResult>;
-    disconnectDevice: (address: string) => Promise<BluetoothActionResult>;
-    forgetDevice: (address: string) => Promise<BluetoothActionResult>;
-    scanDevices: (duration?: number) => Promise<BluetoothActionResult>;
-    getBatteryLevel: (address: string) => Promise<number | null>;
-    onDevicesUpdated: (callback: (devices: DeviceList) => void) => void;
-    onConnectionChanged: (callback: (data: unknown) => void) => void;
-    onBatteryUpdated: (callback: (data: BluetoothBatteryUpdate) => void) => void;
-    onError: (callback: (error: string) => void) => void;
-    onScanStarted: (callback: () => void) => void;
-    onScanCompleted: (callback: () => void) => void;
-    removeAllListeners: () => void;
-}
-
-interface MediaTrack {
-    id: string;
-    title: string | null;
-    artist: string | null;
-    album: string | null;
-    app: string | null;
-    bundleId: string | null;
-    pid: number | null;
-    artworkUrl?: string | null;
-    artworkDataUrl?: string | null;
-    duration?: number | null;
-    elapsed?: number | null;
-    fetchedAt?: number;
-    isPlaying: boolean;
-    source: 'media-remote' | 'applescript' | 'client-only' | 'none';
-}
-
-type MediaAction = 'play-pause' | 'next' | 'previous';
-
-interface MediaHistoryEntry {
-    id: number;
-    title: string | null;
-    artist: string | null;
-    album: string | null;
-    bundleId: string | null;
-    appName: string | null;
-    artworkUrl: string | null;
-    artworkDataUrl: string | null;
-    durationSeconds: number | null;
-    listenedSeconds: number;
-    startedAt: number;
-    endedAt: number | null;
-}
-
-interface MediaStats {
-    totalListenedSeconds: number;
-    uniqueTracks: number;
-    uniqueArtists: number;
-    topArtists: Array<{ artist: string; totalSeconds: number; plays: number }>;
-    topTracks: Array<{ title: string; artist: string | null; totalSeconds: number; plays: number }>;
-    last24hSeconds: number;
-    last7dSeconds: number;
-}
-
-interface MediaArtistGroup {
-    artist: string;
-    totalSeconds: number;
-    totalPlays: number;
-    lastPlayedAt: number;
-    firstPlayedAt: number;
-    tracks: Array<{
-        title: string;
-        album: string | null;
-        artworkUrl: string | null;
-        artworkDataUrl: string | null;
-        totalSeconds: number;
-        totalPlays: number;
-        lastPlayedAt: number;
-    }>;
-}
-
-interface MediaAPI {
-    getNowPlaying: () => Promise<MediaTrack[]>;
-    control: (action: MediaAction, bundleId?: string | null) => Promise<{ success: boolean; error?: string }>;
-    listHistory: (limit?: number) => Promise<MediaHistoryEntry[]>;
-    listArtists: (limit?: number) => Promise<MediaArtistGroup[]>;
-    getStats: () => Promise<MediaStats>;
-    clearHistory: () => Promise<boolean>;
-    clearAllStats: () => Promise<boolean>;
-}
+// Bluetooth domain types + window.bluetoothAPI live in
+// src/features/bluetooth/types.d.ts. Media domain types + window.mediaAPI live
+// in src/features/media/types.d.ts (co-located with each feature).
 
 interface SystemMetrics {
     timestamp: number;
@@ -309,64 +199,6 @@ interface AppAPI {
     hidePopup: () => Promise<boolean>;
 }
 
-interface RdpHost {
-    id: number;
-    label: string;
-    hostname: string;
-    port: number;
-    username: string;
-    hasPassword: boolean;
-    domain?: string;
-    color?: string;
-    notes?: string;
-    extraArgs?: string;
-    createdAt: number;
-    updatedAt: number;
-}
-
-interface RdpHostInput {
-    label: string;
-    hostname: string;
-    port?: number;
-    username: string;
-    password?: string | null;
-    domain?: string | null;
-    color?: string | null;
-    notes?: string | null;
-    extraArgs?: string | null;
-}
-
-interface ActiveRdpSession {
-    id: string;
-    hostId: number;
-    label: string;
-    hostname: string;
-    port: number;
-    pid: number;
-    startedAt: number;
-}
-
-interface RdpExitPayload {
-    sessionId: string;
-    hostId: number;
-    exitCode?: number;
-    error?: string;
-    stderr?: string;
-}
-
-interface RdpAPI {
-    list: () => Promise<RdpHost[]>;
-    create: (input: RdpHostInput) => Promise<RdpHost>;
-    update: (id: number, input: RdpHostInput) => Promise<RdpHost>;
-    remove: (id: number) => Promise<boolean>;
-    connect: (hostId: number) => Promise<{ sessionId: string }>;
-    disconnect: (sessionId: string) => Promise<boolean>;
-    listActive: () => Promise<ActiveRdpSession[]>;
-    available: () => Promise<{ available: boolean; binary: string | null }>;
-    onActiveChanged: (callback: (sessions: ActiveRdpSession[]) => void) => () => void;
-    onSessionExit: (callback: (payload: RdpExitPayload) => void) => () => void;
-}
-
 type ThemePreference = 'light' | 'dark' | 'system';
 
 interface PopupSectionSettings {
@@ -388,10 +220,15 @@ interface HotkeyStatus {
     error: string | null;
 }
 
+interface PluginSettings {
+    disabled: string[];
+}
+
 interface AppSettings {
     theme: ThemePreference;
     popup: PopupSectionSettings;
     hotkey: HotkeySettings;
+    plugins: PluginSettings;
 }
 
 interface SettingsAPI {
@@ -400,11 +237,37 @@ interface SettingsAPI {
     onChanged: (callback: (settings: AppSettings) => void) => () => void;
 }
 
+interface PluginInfo {
+    id: string;
+    name: string;
+    description?: string;
+    icon?: string;
+    enabled: boolean;
+    external: boolean;
+    source?: string;
+    hasRenderer: boolean;
+}
+
+interface PluginInstallResult {
+    ok: boolean;
+    manifest?: { id: string; name: string; version: string };
+    errors?: string[];
+}
+
+interface PluginsAPI {
+    setEnabled: (id: string, enabled: boolean) => Promise<AppSettings>;
+    list: () => Promise<PluginInfo[]>;
+    readRenderer: (id: string) => Promise<string | null>;
+    install: (gitUrl: string) => Promise<PluginInstallResult>;
+    uninstall: (id: string) => Promise<boolean>;
+    onChanged: (callback: () => void) => () => void;
+}
+
 interface HotkeyAPI {
     status: () => Promise<HotkeyStatus>;
 }
 
-type DbTableGroup = 'sshHosts' | 'rdpHosts' | 'mediaHistory' | 'mediaStats';
+type DbTableGroup = 'sshHosts' | 'mediaHistory' | 'mediaStats';
 
 interface DbStats {
     sizeBytes: number;
@@ -476,87 +339,8 @@ interface TransferAPI {
     onDone: (callback: (transfer: ActiveTransfer) => void) => () => void;
 }
 
-interface DockerStatus {
-    available: boolean;
-    version?: string;
-    error?: string;
-}
-
-interface DockerContainer {
-    id: string;
-    name: string;
-    image: string;
-    state: string;
-    status: string;
-    ports: string;
-    command: string;
-    createdAt: string;
-    size: string;
-}
-
-interface DockerImage {
-    id: string;
-    repository: string;
-    tag: string;
-    size: string;
-    createdSince: string;
-}
-
-interface DockerVolume {
-    name: string;
-    driver: string;
-    mountpoint: string;
-    scope: string;
-}
-
-interface DockerNetwork {
-    id: string;
-    name: string;
-    driver: string;
-    scope: string;
-}
-
-interface DockerRunOptions {
-    image: string;
-    name?: string | null;
-    detached?: boolean;
-    autoRemove?: boolean;
-    ports?: Array<{ host: string; container: string }>;
-    env?: Array<{ key: string; value: string }>;
-    volumes?: Array<{ host: string; container: string }>;
-    command?: string | null;
-}
-
-interface DockerAPI {
-    status: () => Promise<DockerStatus>;
-    listContainers: () => Promise<DockerContainer[]>;
-    listImages: () => Promise<DockerImage[]>;
-    listVolumes: () => Promise<DockerVolume[]>;
-    listNetworks: () => Promise<DockerNetwork[]>;
-
-    runImage: (options: DockerRunOptions) => Promise<{ containerId: string }>;
-    startContainer: (id: string) => Promise<boolean>;
-    stopContainer: (id: string) => Promise<boolean>;
-    restartContainer: (id: string) => Promise<boolean>;
-    removeContainer: (id: string, force?: boolean) => Promise<boolean>;
-    removeImage: (id: string, force?: boolean) => Promise<boolean>;
-    removeVolume: (name: string, force?: boolean) => Promise<boolean>;
-    removeNetwork: (name: string) => Promise<boolean>;
-
-    pruneContainers: () => Promise<string>;
-    pruneImages: (all?: boolean) => Promise<string>;
-    pruneVolumes: () => Promise<string>;
-    pruneNetworks: () => Promise<string>;
-    pruneSystem: (all?: boolean) => Promise<string>;
-
-    getLogs: (id: string, tail?: number) => Promise<string>;
-    startExec: (
-        containerId: string,
-        containerName: string,
-        cols: number,
-        rows: number
-    ) => Promise<{ sessionId: string }>;
-}
+// Docker domain types + window.dockerAPI live in
+// src/features/docker/types.d.ts (co-located with the feature).
 
 interface SshAPI {
     listHosts: () => Promise<{ visible: SshHost[]; hidden: SshHost[] }>;
@@ -590,17 +374,14 @@ interface SshAPI {
 }
 
 interface Window {
-    bluetoothAPI: BluetoothAPI;
-    mediaAPI: MediaAPI;
     systemAPI: SystemAPI;
     sshAPI: SshAPI;
     appAPI: AppAPI;
-    dockerAPI: DockerAPI;
     settingsAPI: SettingsAPI;
+    pluginsAPI: PluginsAPI;
     hotkeyAPI: HotkeyAPI;
     dbAPI: DbAPI;
     filesAPI: FilesAPI;
     transferAPI: TransferAPI;
-    rdpAPI: RdpAPI;
     diskAPI: DiskAPI;
 }

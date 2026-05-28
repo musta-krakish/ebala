@@ -2,6 +2,7 @@ import { exec, execFile } from 'child_process';
 import { existsSync, mkdirSync, statSync } from 'fs';
 import path from 'path';
 import { promisify } from 'util';
+import { fileURLToPath } from 'url';
 import { EventEmitter } from 'events';
 import * as plist from 'plist';
 import { helperCacheDir, helperSourceDir } from '../../electron/paths.ts';
@@ -10,9 +11,13 @@ const execPromise = promisify(exec);
 const execFilePromise = promisify(execFile);
 const bluetoothDebugEnabled = process.env.BLUETOOTH_DEBUG === '1';
 
+// Dev-time location of this feature's .swift sources (co-located here).
+// Ignored in packaged builds, which read from the flattened resources dir.
+const featureDir = path.dirname(fileURLToPath(import.meta.url));
+
 async function getSwiftHelper(scriptName: string): Promise<string> {
     const cacheDir = helperCacheDir();
-    const sourcePath = path.join(helperSourceDir(), scriptName);
+    const sourcePath = path.join(helperSourceDir(featureDir), scriptName);
     const outputPath = path.join(cacheDir, scriptName.replace(/\.swift$/, ''));
     const needsBuild =
         !existsSync(outputPath) ||

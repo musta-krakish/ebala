@@ -1,5 +1,6 @@
 import { app, BrowserWindow, globalShortcut, ipcMain, Menu, Tray, nativeImage, screen } from 'electron';
 import { appendFileSync } from 'fs';
+import { readFile } from 'fs/promises';
 import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -26,8 +27,6 @@ process.env.PATH = [...EXTRA_PATHS, process.env.PATH ?? ''].filter(Boolean).join
 if (!process.env.UV_THREADPOOL_SIZE) {
     process.env.UV_THREADPOOL_SIZE = '32';
 }
-import { BluetoothManager } from './src/electron/bluetooth-manager.ts';
-import { MediaManager } from './src/electron/media-manager.ts';
 import { SystemMonitor } from './src/electron/system-monitor.ts';
 import { listAllSshHosts } from './src/electron/ssh-hosts.ts';
 import { SshManager } from './src/electron/ssh-manager.ts';
@@ -40,15 +39,6 @@ import {
     updateSavedHost
 } from './src/electron/saved-hosts.ts';
 import { isCredentialEncryptionAvailable } from './src/electron/credential-store.ts';
-import { MediaTracker } from './src/electron/media-tracker.ts';
-import {
-    clearAllStats,
-    clearHistory,
-    getStats,
-    listArtistGroups,
-    listHistory,
-    purgeOldHistory
-} from './src/electron/media-history.ts';
 import { deleteOverride, upsertOverride } from './src/electron/host-overrides.ts';
 import { removeFromKnownHosts } from './src/electron/ssh-file-ops.ts';
 import {
@@ -57,18 +47,15 @@ import {
     listPortForwards,
     updatePortForward
 } from './src/electron/port-forwards.ts';
-import { DockerManager } from './src/electron/docker-manager.ts';
 import { listLocal, localHome } from './src/electron/local-fs.ts';
 import { SftpManager } from './src/electron/sftp-manager.ts';
 import { RsyncManager } from './src/electron/rsync-manager.ts';
-import {
-    createRdpHost,
-    deleteRdpHost,
-    listRdpHosts,
-    updateRdpHost
-} from './src/electron/rdp-hosts.ts';
-import { RdpManager } from './src/electron/rdp-manager.ts';
 import { DiskScanner } from './src/electron/disk-scanner.ts';
+import { initPluginManager, applyEnabled, disposeAllPlugins, registerPlugin, unregisterPlugin } from './src/plugin/manager.js';
+import { mainPlugins } from './src/features/main-plugins.js';
+import { discoverPlugins, loadExternalMainPlugin, pluginsDir } from './src/plugin/external-main.js';
+import { installPlugin, uninstallPlugin } from './src/plugin/installer.js';
+import { isRouted, routeTerminal } from './src/plugin/terminal-router.ts';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const devServerUrl = process.env.VITE_DEV_SERVER_URL;
@@ -89,27 +76,20 @@ let mainWindow;
 let popupWindow;
 let tray;
 let isQuitting = false;
-let bluetoothManager;
 let registeredHotkey = null;
 let hotkeyError = null;
 
 const POPUP_WIDTH = 380;
 const POPUP_HEIGHT = 560;
-const mediaManager = new MediaManager();
 const systemMonitor = new SystemMonitor();
-const mediaTracker = new MediaTracker(mediaManager);
 const sshManager = new SshManager();
-const dockerManager = new DockerManager();
 const sftpManager = new SftpManager();
 const rsyncManager = new RsyncManager();
-const rdpManager = new RdpManager();
 const diskScanner = new DiskScanner();
 diskScanner.on('progress', (payload) => broadcast('disk:scan-progress', payload));
 
 rsyncManager.on('progress', (payload) => broadcast('transfer:progress', payload));
 rsyncManager.on('done', (payload) => broadcast('transfer:done', payload));
-rdpManager.on('active-changed', (payload) => broadcast('rdp:active-changed', payload));
-rdpManager.on('exit', (payload) => broadcast('rdp:session-exit', payload));
 const rendererWindows = new Set();
 const detachedSessions = new Map(); // sessionId -> BrowserWindow
 
@@ -126,6 +106,31 @@ function broadcast(channel, payload) {
     }
 }
 
+const pluginCtx = { ipcMain, broadcast };
+
+// Installed external plugins: [{ dir, manifest }]. Populated on startup and on
+// install. Reserved ids can't be shadowed by an installed plugin.
+let externalPlugins = [];
+const RESERVED_PLUGIN_IDS = ['ssh', 'docker', 'bluetooth', 'system', 'disk', 'media', 'settings'];
+
+function pluginsBaseDir() {
+    return pluginsDir(app.getPath('userData'));
+}
+
+function externalPluginInfo(settings) {
+    const disabled = new Set(settings.plugins.disabled);
+    return externalPlugins.map(({ manifest }) => ({
+        id: manifest.id,
+        name: manifest.name,
+        description: manifest.description,
+        icon: manifest.icon,
+        enabled: !disabled.has(manifest.id),
+        external: true,
+        source: manifest.source,
+        hasRenderer: Boolean(manifest.capabilities.renderer)
+    }));
+}
+
 sshManager.on('data', (payload) => broadcast('ssh:session-data', payload));
 sshManager.on('exit', (payload) => {
     broadcast('ssh:session-exit', payload);
@@ -136,10 +141,6 @@ sshManager.on('exit', (payload) => {
     detachedSessions.delete(payload.sessionId);
 });
 
-// Docker exec sessions piggy-back on the ssh terminal channels so the renderer
-// can use the same xterm pipeline regardless of session kind.
-dockerManager.on('exec-data', (payload) => broadcast('ssh:session-data', payload));
-dockerManager.on('exec-exit', (payload) => broadcast('ssh:session-exit', payload));
 
 async function waitForDevServer(url) {
     for (let attempt = 0; attempt < 50; attempt += 1) {
@@ -416,97 +417,7 @@ async function createDetachedWindow(sessionId, hostMeta) {
     });
 }
 
-async function initBluetoothManager() {
-    bluetoothManager = new BluetoothManager();
-
-    bluetoothManager.on('devices-updated', (devices) => broadcast('bluetooth:devices-updated', devices));
-    bluetoothManager.on('connection-changed', (data) => broadcast('bluetooth:connection-changed', data));
-    bluetoothManager.on('battery-updated', (data) => broadcast('bluetooth:battery-updated', data));
-    bluetoothManager.on('error', (error) => broadcast('bluetooth:error', error));
-    bluetoothManager.on('scan-started', () => broadcast('bluetooth:scan-started'));
-    bluetoothManager.on('scan-completed', () => broadcast('bluetooth:scan-completed'));
-
-    await bluetoothManager.startMonitoring();
-}
-
 // IPC Handlers
-// bluetoothManager is initialised async after whenReady; renderer can call
-// these IPCs before that completes, so guard every handler with a fallback.
-async function whenBluetoothReady() {
-    if (bluetoothManager) return bluetoothManager;
-    // Wait up to 5s for init — beyond that, treat as unavailable.
-    for (let i = 0; i < 50; i += 1) {
-        if (bluetoothManager) return bluetoothManager;
-        await new Promise((resolve) => setTimeout(resolve, 100));
-    }
-    return null;
-}
-
-ipcMain.handle('bluetooth:get-devices', async () => {
-    const mgr = await whenBluetoothReady();
-    if (!mgr) return { connected: [], notConnected: [], timestamp: Date.now() };
-    return await mgr.getDevices();
-});
-
-ipcMain.handle('bluetooth:connect-device', async (event, address) => {
-    const mgr = await whenBluetoothReady();
-    if (!mgr) return { success: false, error: 'Bluetooth not ready' };
-    return await mgr.connectDevice(address);
-});
-
-ipcMain.handle('bluetooth:disconnect-device', async (event, address) => {
-    const mgr = await whenBluetoothReady();
-    if (!mgr) return { success: false, error: 'Bluetooth not ready' };
-    return await mgr.disconnectDevice(address);
-});
-
-ipcMain.handle('bluetooth:forget-device', async (event, address) => {
-    const mgr = await whenBluetoothReady();
-    if (!mgr) return { success: false, error: 'Bluetooth not ready' };
-    return await mgr.forgetDevice(address);
-});
-
-ipcMain.handle('bluetooth:scan-devices', async (event, duration = 5) => {
-    const mgr = await whenBluetoothReady();
-    if (!mgr) return { success: false, error: 'Bluetooth not ready' };
-    return await mgr.scanForDevices(duration);
-});
-
-ipcMain.handle('bluetooth:get-battery', async (event, address) => {
-    const mgr = await whenBluetoothReady();
-    if (!mgr) return null;
-    return await mgr.getBatteryLevel(address);
-});
-
-ipcMain.handle('media:get-now-playing', async () => {
-    return await mediaManager.getAllNowPlaying();
-});
-
-ipcMain.handle('media:control', async (event, action, bundleId) => {
-    return await mediaManager.control(action, bundleId);
-});
-
-ipcMain.handle('media:list-history', async (event, limit) => {
-    return listHistory(typeof limit === 'number' ? limit : 50);
-});
-
-ipcMain.handle('media:stats', async () => {
-    return getStats();
-});
-
-ipcMain.handle('media:clear-history', async () => {
-    await clearHistory();
-    return true;
-});
-
-ipcMain.handle('media:clear-all-stats', async () => {
-    await clearAllStats();
-    return true;
-});
-
-ipcMain.handle('media:list-artists', async (event, limit) => {
-    return listArtistGroups(typeof limit === 'number' ? limit : 30);
-});
 
 ipcMain.handle('system:get-metrics', async () => {
     return await systemMonitor.getMetrics();
@@ -610,24 +521,20 @@ ipcMain.handle('ssh:delete-forward', async (event, id) => {
     return true;
 });
 
+// Terminal I/O: a registered backend (e.g. Docker exec) may own the session;
+// otherwise it's a regular SSH session.
 ipcMain.handle('ssh:write', async (event, sessionId, data) => {
-    if (dockerManager.ownsExec(sessionId)) {
-        return dockerManager.writeExec(sessionId, data);
-    }
+    if (isRouted(sessionId)) return routeTerminal('write', sessionId, data);
     return sshManager.write(sessionId, data);
 });
 
 ipcMain.handle('ssh:resize', async (event, sessionId, cols, rows) => {
-    if (dockerManager.ownsExec(sessionId)) {
-        return dockerManager.resizeExec(sessionId, cols, rows);
-    }
+    if (isRouted(sessionId)) return routeTerminal('resize', sessionId, cols, rows);
     return sshManager.resize(sessionId, cols, rows);
 });
 
 ipcMain.handle('ssh:close-session', async (event, sessionId) => {
-    if (dockerManager.ownsExec(sessionId)) {
-        return dockerManager.closeExec(sessionId);
-    }
+    if (isRouted(sessionId)) return routeTerminal('close', sessionId);
     return sshManager.close(sessionId);
 });
 
@@ -659,6 +566,65 @@ ipcMain.handle('settings:update', async (event, patch) => {
     if (patch?.hotkey) applyHotkey(next);
     broadcast('settings:changed', next);
     return next;
+});
+
+ipcMain.handle('plugins:set-enabled', async (event, id, enabled) => {
+    const current = await loadSettings();
+    const disabled = new Set(current.plugins.disabled);
+    if (enabled) disabled.delete(id);
+    else disabled.add(id);
+    const next = await updateSettings({ plugins: { disabled: [...disabled] } });
+    applyEnabled(next.plugins.disabled);
+    broadcast('settings:changed', next);
+    return next;
+});
+
+ipcMain.handle('plugins:list', async () => {
+    const settings = await loadSettings();
+    return externalPluginInfo(settings);
+});
+
+ipcMain.handle('plugins:read-renderer', async (event, id) => {
+    const entry = externalPlugins.find((p) => p.manifest.id === id);
+    if (!entry || !entry.manifest.capabilities.renderer) return null;
+    return await readFile(path.join(entry.dir, entry.manifest.capabilities.renderer), 'utf8');
+});
+
+ipcMain.handle('plugins:install', async (event, gitUrl) => {
+    if (typeof gitUrl !== 'string' || !gitUrl.trim()) {
+        return { ok: false, errors: ['Provide a git URL or local path'] };
+    }
+    const existingIds = [...RESERVED_PLUGIN_IDS, ...externalPlugins.map((p) => p.manifest.id)];
+    const result = await installPlugin(gitUrl.trim(), pluginsBaseDir(), existingIds);
+    if (!result.ok) return result;
+
+    externalPlugins.push({ dir: result.dir, manifest: result.manifest });
+    try {
+        const plugin = await loadExternalMainPlugin(result.dir, result.manifest);
+        if (plugin) registerPlugin(plugin);
+    } catch (err) {
+        logFatal(`load installed plugin ${result.manifest.id}`, err);
+    }
+    const settings = await loadSettings();
+    applyEnabled(settings.plugins.disabled);
+    broadcast('plugins:changed');
+    return { ok: true, manifest: result.manifest };
+});
+
+ipcMain.handle('plugins:uninstall', async (event, id) => {
+    await unregisterPlugin(id);
+    externalPlugins = externalPlugins.filter((p) => p.manifest.id !== id);
+    await uninstallPlugin(id, pluginsBaseDir());
+
+    const current = await loadSettings();
+    if (current.plugins.disabled.includes(id)) {
+        const next = await updateSettings({
+            plugins: { disabled: current.plugins.disabled.filter((x) => x !== id) }
+        });
+        broadcast('settings:changed', next);
+    }
+    broadcast('plugins:changed');
+    return true;
 });
 
 ipcMain.handle('hotkey:status', () => ({
@@ -714,125 +680,6 @@ ipcMain.handle('transfer:sshpass-available', async () => {
     return rsyncManager.isSshpassAvailable();
 });
 
-ipcMain.handle('rdp:list', async () => {
-    return listRdpHosts();
-});
-
-ipcMain.handle('rdp:create', async (event, input) => {
-    return await createRdpHost(input);
-});
-
-ipcMain.handle('rdp:update', async (event, id, input) => {
-    return await updateRdpHost(id, input);
-});
-
-ipcMain.handle('rdp:delete', async (event, id) => {
-    return await deleteRdpHost(id);
-});
-
-ipcMain.handle('rdp:connect', async (event, hostId) => {
-    return await rdpManager.connect(hostId);
-});
-
-ipcMain.handle('rdp:disconnect', async (event, sessionId) => {
-    return rdpManager.disconnect(sessionId);
-});
-
-ipcMain.handle('rdp:list-active', async () => {
-    return rdpManager.list();
-});
-
-ipcMain.handle('rdp:available', async () => {
-    return { available: rdpManager.isAvailable(), binary: rdpManager.getBinary() };
-});
-
-ipcMain.handle('docker:status', async () => {
-    return dockerManager.isAvailable();
-});
-
-ipcMain.handle('docker:list-containers', async () => {
-    return dockerManager.listContainers();
-});
-
-ipcMain.handle('docker:list-images', async () => {
-    return dockerManager.listImages();
-});
-
-ipcMain.handle('docker:list-volumes', async () => {
-    return dockerManager.listVolumes();
-});
-
-ipcMain.handle('docker:list-networks', async () => {
-    return dockerManager.listNetworks();
-});
-
-ipcMain.handle('docker:run-image', async (event, options) => {
-    return dockerManager.runImage(options);
-});
-
-ipcMain.handle('docker:start-container', async (event, id) => {
-    await dockerManager.startContainer(id);
-    return true;
-});
-
-ipcMain.handle('docker:stop-container', async (event, id) => {
-    await dockerManager.stopContainer(id);
-    return true;
-});
-
-ipcMain.handle('docker:restart-container', async (event, id) => {
-    await dockerManager.restartContainer(id);
-    return true;
-});
-
-ipcMain.handle('docker:remove-container', async (event, id, force) => {
-    await dockerManager.removeContainer(id, Boolean(force));
-    return true;
-});
-
-ipcMain.handle('docker:remove-image', async (event, id, force) => {
-    await dockerManager.removeImage(id, Boolean(force));
-    return true;
-});
-
-ipcMain.handle('docker:remove-volume', async (event, name, force) => {
-    await dockerManager.removeVolume(name, Boolean(force));
-    return true;
-});
-
-ipcMain.handle('docker:remove-network', async (event, name) => {
-    await dockerManager.removeNetwork(name);
-    return true;
-});
-
-ipcMain.handle('docker:prune-containers', async () => {
-    return dockerManager.pruneContainers();
-});
-
-ipcMain.handle('docker:prune-images', async (event, all) => {
-    return dockerManager.pruneImages(Boolean(all));
-});
-
-ipcMain.handle('docker:prune-volumes', async () => {
-    return dockerManager.pruneVolumes();
-});
-
-ipcMain.handle('docker:prune-networks', async () => {
-    return dockerManager.pruneNetworks();
-});
-
-ipcMain.handle('docker:prune-system', async (event, all) => {
-    return dockerManager.pruneSystem(Boolean(all));
-});
-
-ipcMain.handle('docker:logs', async (event, id, tail) => {
-    return dockerManager.getLogs(id, typeof tail === 'number' ? tail : 500);
-});
-
-ipcMain.handle('docker:exec-start', async (event, containerId, containerName, cols, rows) => {
-    return dockerManager.startExec(containerId, containerName, cols, rows);
-});
-
 ipcMain.handle('ssh:detach-session', async (event, sessionId, hostMeta) => {
     if (detachedSessions.has(sessionId)) {
         const existing = detachedSessions.get(sessionId);
@@ -863,14 +710,20 @@ app.whenReady().then(async () => {
     try {
         await initDb();
         const settings = await loadSettings();
-        // Drop track entries older than retention window — stats live in
-        // dedicated tables so this only trims the recent-list.
-        await purgeOldHistory();
+        initPluginManager(mainPlugins, pluginCtx);
+        externalPlugins = await discoverPlugins(pluginsBaseDir());
+        for (const { dir, manifest } of externalPlugins) {
+            try {
+                const plugin = await loadExternalMainPlugin(dir, manifest);
+                if (plugin) registerPlugin(plugin);
+            } catch (err) {
+                logFatal(`load external plugin ${manifest.id}`, err);
+            }
+        }
         await createMainWindow();
         createTray();
         applyHotkey(settings);
-        initBluetoothManager();
-        mediaTracker.start();
+        applyEnabled(settings.plugins.disabled);
     } catch (err) {
         logFatal('whenReady', err);
         throw err;
@@ -895,15 +748,10 @@ app.on('window-all-closed', () => {
 
 app.on('will-quit', async () => {
     globalShortcut.unregisterAll();
-    if (bluetoothManager) {
-        bluetoothManager.stopMonitoring();
-    }
+    await disposeAllPlugins();
     sshManager.dispose();
-    dockerManager.dispose();
     sftpManager.dispose();
     rsyncManager.dispose();
-    rdpManager.dispose();
     diskScanner.cancel();
-    await mediaTracker.stop();
     await closeDb();
 });
