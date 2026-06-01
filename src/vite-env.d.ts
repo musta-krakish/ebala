@@ -197,6 +197,7 @@ interface SshActiveSession {
 interface AppAPI {
     showMain: () => Promise<boolean>;
     hidePopup: () => Promise<boolean>;
+    closeSelf: () => Promise<boolean>;
 }
 
 type ThemePreference = 'light' | 'dark' | 'system';

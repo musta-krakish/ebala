@@ -3,5 +3,11 @@
 import { createBluetoothPlugin } from './bluetooth/main.ts';
 import { createDockerPlugin } from './docker/main.ts';
 import { createMediaPlugin } from './media/main.ts';
+import { createTerminalPlugin } from './terminal/main.ts';
 
-export const mainPlugins = [createBluetoothPlugin(), createDockerPlugin(), createMediaPlugin()];
+export const mainPlugins = [
+    createBluetoothPlugin(),
+    createDockerPlugin(),
+    createMediaPlugin(),
+    createTerminalPlugin()
+];

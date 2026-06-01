@@ -65,7 +65,8 @@ contextBridge.exposeInMainWorld('diskAPI', {
 
 contextBridge.exposeInMainWorld('appAPI', {
     showMain: () => ipcRenderer.invoke('app:show-main'),
-    hidePopup: () => ipcRenderer.invoke('app:hide-popup')
+    hidePopup: () => ipcRenderer.invoke('app:hide-popup'),
+    closeSelf: () => ipcRenderer.invoke('app:close-self')
 });
 
 contextBridge.exposeInMainWorld('settingsAPI', {
@@ -198,5 +199,25 @@ contextBridge.exposeInMainWorld('sshAPI', {
         const listener = (_, payload) => callback(payload);
         ipcRenderer.on('ssh:session-exit', listener);
         return () => ipcRenderer.removeListener('ssh:session-exit', listener);
+    }
+});
+
+contextBridge.exposeInMainWorld('terminalAPI', {
+    spawn: (options) => ipcRenderer.invoke('terminal:spawn', options ?? {}),
+    write: (sessionId, data) => ipcRenderer.invoke('terminal:write', sessionId, data),
+    resize: (sessionId, cols, rows) => ipcRenderer.invoke('terminal:resize', sessionId, cols, rows),
+    close: (sessionId) => ipcRenderer.invoke('terminal:close', sessionId),
+    detach: (sessionId, meta) => ipcRenderer.invoke('terminal:detach', sessionId, meta),
+    context: (cwd) => ipcRenderer.invoke('terminal:context', cwd),
+
+    onData: (callback) => {
+        const listener = (_, payload) => callback(payload);
+        ipcRenderer.on('terminal:data', listener);
+        return () => ipcRenderer.removeListener('terminal:data', listener);
+    },
+    onExit: (callback) => {
+        const listener = (_, payload) => callback(payload);
+        ipcRenderer.on('terminal:exit', listener);
+        return () => ipcRenderer.removeListener('terminal:exit', listener);
     }
 });

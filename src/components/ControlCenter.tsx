@@ -83,7 +83,7 @@ export function ControlCenter() {
     const externalTabIds = enabledPlugins
         .filter((plugin) => !rendererPlugins.includes(plugin))
         .map((plugin) => plugin.id);
-    const tabOrder = ['ssh', 'docker', 'bluetooth', 'system', 'disk', 'media', ...externalTabIds, 'settings'];
+    const tabOrder = ['terminal', 'ssh', 'docker', 'bluetooth', 'system', 'disk', 'media', ...externalTabIds, 'settings'];
     const tabs: TabItem[] = tabOrder.map((id) => pluginTabs[id] ?? legacyTabs[id]).filter(
         (tab): tab is TabItem => Boolean(tab)
     );
@@ -96,8 +96,8 @@ export function ControlCenter() {
 
     return (
         <ExecProvider value={execValue}>
-        <main className="min-h-screen bg-zinc-100 text-zinc-950 dark:bg-zinc-950 dark:text-zinc-50">
-            <header className="drag-region sticky top-0 z-50 border-b border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-900">
+        <main className="flex h-screen flex-col overflow-hidden bg-zinc-100 text-zinc-950 dark:bg-zinc-950 dark:text-zinc-50">
+            <header className="drag-region z-50 shrink-0 border-b border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-900">
                 <div className="mx-auto flex w-full max-w-7xl items-center justify-between gap-4 px-4 py-3 sm:px-6 lg:px-8">
                     <div className="flex items-center gap-3 pl-16">
                         <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-zinc-950 text-white dark:bg-indigo-500">
@@ -166,16 +166,9 @@ export function ControlCenter() {
                 </div>
             </header>
 
-            <div className="mx-auto w-full max-w-7xl px-4 py-5 sm:px-6 lg:px-8">
-                {error && (
-                    <div className="mb-4 rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-800 dark:border-rose-900 dark:bg-rose-950 dark:text-rose-200">
-                        {error}
-                    </div>
-                )}
-
-                {activeTab === 'ssh' && <SshPanel sshSessions={sshSessions} />}
-
-                {activePlugin && (
+            <div className="min-h-0 flex-1 overflow-hidden">
+                {activeTab === 'terminal' && activePlugin ? (
+                    // Full-bleed: the terminal owns the whole viewport below the header.
                     <Suspense
                         fallback={
                             <div className="py-10 text-center text-sm text-zinc-500 dark:text-zinc-400">Loading…</div>
@@ -183,19 +176,43 @@ export function ControlCenter() {
                     >
                         <activePlugin.Panel />
                     </Suspense>
+                ) : (
+                    <div className="h-full overflow-y-auto">
+                        <div className="mx-auto w-full max-w-7xl px-4 py-5 sm:px-6 lg:px-8">
+                            {error && (
+                                <div className="mb-4 rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-800 dark:border-rose-900 dark:bg-rose-950 dark:text-rose-200">
+                                    {error}
+                                </div>
+                            )}
+
+                            {activeTab === 'ssh' && <SshPanel sshSessions={sshSessions} />}
+
+                            {activePlugin && activeTab !== 'terminal' && (
+                                <Suspense
+                                    fallback={
+                                        <div className="py-10 text-center text-sm text-zinc-500 dark:text-zinc-400">
+                                            Loading…
+                                        </div>
+                                    }
+                                >
+                                    <activePlugin.Panel />
+                                </Suspense>
+                            )}
+
+                            {activeTab === 'system' && (
+                                <SystemMonitorPanel
+                                    metrics={system.metrics}
+                                    loading={system.loading}
+                                    onRefresh={system.refresh}
+                                />
+                            )}
+
+                            {activeTab === 'disk' && <DiskUsagePanel />}
+
+                            {activeTab === 'settings' && <SettingsPanel />}
+                        </div>
+                    </div>
                 )}
-
-                {activeTab === 'system' && (
-                    <SystemMonitorPanel
-                        metrics={system.metrics}
-                        loading={system.loading}
-                        onRefresh={system.refresh}
-                    />
-                )}
-
-                {activeTab === 'disk' && <DiskUsagePanel />}
-
-                {activeTab === 'settings' && <SettingsPanel />}
             </div>
 
             <SshTerminalDrawer

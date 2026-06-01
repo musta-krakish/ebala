@@ -378,11 +378,20 @@ function createTray() {
     tray.on('right-click', () => tray.popUpContextMenu(buildMenu()));
 }
 
-async function createDetachedWindow(sessionId, hostMeta) {
+async function createDetachedWindow(sessionId, meta, kind = 'ssh') {
+    const isTerminal = kind === 'terminal';
+    const title = isTerminal
+        ? meta?.title
+            ? `Terminal · ${meta.title}`
+            : 'Terminal'
+        : meta?.alias
+          ? `SSH · ${meta.alias}`
+          : 'SSH Session';
+
     const win = new BrowserWindow({
         width: 900,
         height: 600,
-        title: hostMeta?.alias ? `SSH · ${hostMeta.alias}` : 'SSH Session',
+        title,
         webPreferences: {
             nodeIntegration: false,
             contextIsolation: true,
@@ -394,13 +403,19 @@ async function createDetachedWindow(sessionId, hostMeta) {
     registerRendererWindow(win);
     detachedSessions.set(sessionId, win);
 
-    const params = new URLSearchParams({
-        session: sessionId,
-        alias: hostMeta?.alias ?? '',
-        user: hostMeta?.user ?? '',
-        hostname: hostMeta?.hostname ?? '',
-        port: hostMeta?.port ? String(hostMeta.port) : ''
-    });
+    const params = isTerminal
+        ? new URLSearchParams({
+              terminal: sessionId,
+              title: meta?.title ?? '',
+              cwd: meta?.cwd ?? ''
+          })
+        : new URLSearchParams({
+              session: sessionId,
+              alias: meta?.alias ?? '',
+              user: meta?.user ?? '',
+              hostname: meta?.hostname ?? '',
+              port: meta?.port ? String(meta.port) : ''
+          });
 
     if (isDev) {
         await waitForDevServer(devServerUrl);
@@ -413,7 +428,13 @@ async function createDetachedWindow(sessionId, hostMeta) {
 
     win.on('closed', () => {
         detachedSessions.delete(sessionId);
-        sshManager.close(sessionId);
+        if (isTerminal) {
+            // Terminal sessions live in the terminal plugin's manager; close via
+            // the shared terminal-router (registered by createTerminalPlugin).
+            routeTerminal('close', sessionId);
+        } else {
+            sshManager.close(sessionId);
+        }
     });
 }
 
@@ -688,6 +709,22 @@ ipcMain.handle('ssh:detach-session', async (event, sessionId, hostMeta) => {
     }
     await createDetachedWindow(sessionId, hostMeta);
     return { success: true };
+});
+
+ipcMain.handle('terminal:detach', async (event, sessionId, meta) => {
+    if (detachedSessions.has(sessionId)) {
+        const existing = detachedSessions.get(sessionId);
+        if (!existing.isDestroyed()) existing.focus();
+        return { success: true };
+    }
+    await createDetachedWindow(sessionId, meta, 'terminal');
+    return { success: true };
+});
+
+ipcMain.handle('app:close-self', async (event) => {
+    const win = BrowserWindow.fromWebContents(event.sender);
+    if (win && !win.isDestroyed()) win.close();
+    return true;
 });
 
 // Write any unhandled startup error to a known location so packaged-build
